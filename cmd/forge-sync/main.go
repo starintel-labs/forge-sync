@@ -125,12 +125,12 @@ func openRuntime(cfg config.Config) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
-	githubClient, err := github.New(cfg.GitHubAPI, cfg.GitHubToken, cfg.RequestTimeout)
+	githubClient, err := github.New(cfg.GitHubAPI, cfg.GitHubToken, cfg.RequestTimeout, github.WithRetry(cfg.APIRetry))
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
-	forgejoClient, err := forgejo.New(cfg.ForgejoAPI, cfg.ForgejoToken, cfg.RequestTimeout)
+	forgejoClient, err := forgejo.New(cfg.ForgejoAPI, cfg.ForgejoToken, cfg.RequestTimeout, forgejo.WithRetry(cfg.APIRetry))
 	if err != nil {
 		store.Close()
 		return nil, err

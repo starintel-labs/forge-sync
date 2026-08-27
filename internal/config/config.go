@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/starintel-labs/forge-sync/internal/api"
 )
 
 const (
@@ -29,6 +31,7 @@ type Config struct {
 	GitTimeout           time.Duration
 	MaxConcurrency       int
 	MaxWebhookBody       int64
+	APIRetry             api.RetryPolicy
 }
 
 func FromEnvironment() (Config, error) {
@@ -47,6 +50,12 @@ func FromEnvironment() (Config, error) {
 		GitTimeout:           durationOr("FORGE_SYNC_GIT_TIMEOUT", 5*time.Minute),
 		MaxConcurrency:       intOr("FORGE_SYNC_MAX_CONCURRENCY", 4),
 		MaxWebhookBody:       int64Or("FORGE_SYNC_MAX_WEBHOOK_BODY", 1<<20),
+		APIRetry: api.RetryPolicy{
+			MaxAttempts: intOr("FORGE_SYNC_API_MAX_ATTEMPTS", 4),
+			BaseDelay:   durationOr("FORGE_SYNC_API_RETRY_BASE", time.Second),
+			MaxDelay:    durationOr("FORGE_SYNC_API_RETRY_MAX", 30*time.Second),
+			Sleep:       api.Sleep,
+		},
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -89,6 +98,9 @@ func (c Config) Validate() error {
 	}
 	if c.RequestTimeout <= 0 || c.GitTimeout <= 0 {
 		return errors.New("request and Git timeouts must be positive")
+	}
+	if err := c.APIRetry.Validate(); err != nil {
+		return fmt.Errorf("API retry policy: %w", err)
 	}
 	return nil
 }
