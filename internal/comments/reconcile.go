@@ -45,24 +45,51 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 		if err != nil {
 			return fmt.Errorf("list Forgejo comments for issue %d: %w", issueMapping.ForgejoID, err)
 		}
-		if err := validate(githubComments); err != nil {
-			return err
-		}
-		if err := validate(forgejoComments); err != nil {
-			return err
-		}
-		mappings, err := r.store.ListCommentMappings(ctx, repository.GitHubID, issueMapping.GitHubID)
-		if err != nil {
-			return err
-		}
-		if err := r.reconcileIssue(ctx, repository, issueMapping, githubOwner, githubName, githubComments, forgejoComments, mappings, dryRun); err != nil {
+		if err := r.reconcileThread(ctx, repository, thread{githubID: issueMapping.GitHubID, githubIndex: issueMapping.GitHubIndex, forgejoIndex: issueMapping.ForgejoIndex}, githubOwner, githubName, githubComments, forgejoComments, dryRun); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *Reconciler) reconcileIssue(ctx context.Context, repository model.RepositoryMapping, issueMapping model.IssueMapping, githubOwner, githubName string, githubComments, forgejoComments []model.Comment, mappings []model.CommentMapping, dryRun bool) error {
+func (r *Reconciler) ReconcilePullRequests(ctx context.Context, repository model.RepositoryMapping, pullRequestMappings []model.PullRequestMapping, dryRun bool) error {
+	githubOwner, githubName, ok := strings.Cut(repository.GitHubFullName, "/")
+	if !ok || githubOwner == "" || githubName == "" || repository.ForgejoOwner == "" || repository.ForgejoName == "" {
+		return errors.New("repository mapping has invalid identity")
+	}
+	for _, pullRequestMapping := range pullRequestMappings {
+		githubComments, err := r.github.ListComments(ctx, githubOwner, githubName, pullRequestMapping.GitHubIndex)
+		if err != nil {
+			return fmt.Errorf("list GitHub comments for pull request %d: %w", pullRequestMapping.GitHubID, err)
+		}
+		forgejoComments, err := r.forgejo.ListComments(ctx, repository.ForgejoOwner, repository.ForgejoName, pullRequestMapping.ForgejoIndex)
+		if err != nil {
+			return fmt.Errorf("list Forgejo comments for pull request %d: %w", pullRequestMapping.ForgejoID, err)
+		}
+		if err := r.reconcileThread(ctx, repository, thread{githubID: pullRequestMapping.GitHubID, githubIndex: pullRequestMapping.GitHubIndex, forgejoIndex: pullRequestMapping.ForgejoIndex}, githubOwner, githubName, githubComments, forgejoComments, dryRun); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type thread struct {
+	githubID     int64
+	githubIndex  int64
+	forgejoIndex int64
+}
+
+func (r *Reconciler) reconcileThread(ctx context.Context, repository model.RepositoryMapping, target thread, githubOwner, githubName string, githubComments, forgejoComments []model.Comment, dryRun bool) error {
+	if err := validate(githubComments); err != nil {
+		return err
+	}
+	if err := validate(forgejoComments); err != nil {
+		return err
+	}
+	mappings, err := r.store.ListCommentMappings(ctx, repository.GitHubID, target.githubID)
+	if err != nil {
+		return err
+	}
 	githubByID := commentByID(githubComments)
 	forgejoByID := commentByID(forgejoComments)
 	consumedGitHub := map[int64]bool{}
@@ -132,7 +159,7 @@ func (r *Reconciler) reconcileIssue(ctx context.Context, repository model.Reposi
 		githubComment, forgejoComment := githubByID[githubID], forgejoByID[forgejoID]
 		consumedGitHub[githubID], consumedForgejo[forgejoID] = true, true
 		if !dryRun {
-			if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, issueMapping.GitHubID, githubComment, forgejoComment)); err != nil {
+			if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, target.githubID, githubComment, forgejoComment)); err != nil {
 				return err
 			}
 		}
@@ -141,11 +168,11 @@ func (r *Reconciler) reconcileIssue(ctx context.Context, repository model.Reposi
 		if dryRun {
 			continue
 		}
-		created, err := r.forgejo.CreateComment(ctx, repository.ForgejoOwner, repository.ForgejoName, issueMapping.ForgejoIndex, githubComment)
+		created, err := r.forgejo.CreateComment(ctx, repository.ForgejoOwner, repository.ForgejoName, target.forgejoIndex, githubComment)
 		if err != nil {
 			return err
 		}
-		if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, issueMapping.GitHubID, githubComment, created)); err != nil {
+		if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, target.githubID, githubComment, created)); err != nil {
 			return err
 		}
 	}
@@ -153,11 +180,11 @@ func (r *Reconciler) reconcileIssue(ctx context.Context, repository model.Reposi
 		if dryRun {
 			continue
 		}
-		created, err := r.github.CreateComment(ctx, githubOwner, githubName, issueMapping.GitHubIndex, forgejoComment)
+		created, err := r.github.CreateComment(ctx, githubOwner, githubName, target.githubIndex, forgejoComment)
 		if err != nil {
 			return err
 		}
-		if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, issueMapping.GitHubID, created, forgejoComment)); err != nil {
+		if err := r.store.UpsertCommentMapping(ctx, mappingFor(repository.GitHubID, target.githubID, created, forgejoComment)); err != nil {
 			return err
 		}
 	}

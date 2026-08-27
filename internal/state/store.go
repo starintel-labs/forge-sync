@@ -25,7 +25,9 @@ type Store struct {
 type Stats struct {
 	Repositories int
 	Issues       int
+	PullRequests int
 	Comments     int
+	Releases     int
 	Conflicts    int
 	Deliveries   int
 	Runs         int
@@ -73,7 +75,9 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	}{
 		{"repositories", `SELECT COUNT(*) FROM repository_mappings`, nil},
 		{"issues", `SELECT COUNT(*) FROM issue_mappings`, nil},
+		{"pull_requests", `SELECT COUNT(*) FROM pull_request_mappings`, nil},
 		{"comments", `SELECT COUNT(*) FROM comment_mappings`, nil},
+		{"releases", `SELECT COUNT(*) FROM release_mappings`, nil},
 		{"conflicts", `SELECT COUNT(*) FROM conflicts WHERE resolved_at IS NULL`, nil},
 		{"deliveries", `SELECT COUNT(*) FROM webhook_deliveries`, nil},
 		{"runs", `SELECT COUNT(*) FROM reconciliation_runs`, nil},
@@ -81,10 +85,12 @@ func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	var stats Stats
 	queries[0].value = &stats.Repositories
 	queries[1].value = &stats.Issues
-	queries[2].value = &stats.Comments
-	queries[3].value = &stats.Conflicts
-	queries[4].value = &stats.Deliveries
-	queries[5].value = &stats.Runs
+	queries[2].value = &stats.PullRequests
+	queries[3].value = &stats.Comments
+	queries[4].value = &stats.Releases
+	queries[5].value = &stats.Conflicts
+	queries[6].value = &stats.Deliveries
+	queries[7].value = &stats.Runs
 	for _, item := range queries {
 		if err := s.db.QueryRowContext(ctx, item.query).Scan(item.value); err != nil {
 			return Stats{}, fmt.Errorf("count %s: %w", item.name, err)
@@ -253,6 +259,55 @@ FROM issue_mappings WHERE repository_github_id = ? ORDER BY github_id`, reposito
 	return result, rows.Err()
 }
 
+func (s *Store) UpsertPullRequestMapping(ctx context.Context, mapping model.PullRequestMapping) error {
+	if mapping.RepositoryGitHubID <= 0 || mapping.GitHubID <= 0 || mapping.ForgejoID <= 0 || mapping.GitHubIndex <= 0 || mapping.ForgejoIndex <= 0 || mapping.LastStateHash == "" {
+		return errors.New("pull request mapping is incomplete")
+	}
+	if mapping.UpdatedAt.IsZero() {
+		mapping.UpdatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO pull_request_mappings
+    (repository_github_id, github_id, forgejo_id, github_index, forgejo_index, last_state_hash, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(repository_github_id, github_id) DO UPDATE SET
+    forgejo_id = excluded.forgejo_id,
+    github_index = excluded.github_index,
+    forgejo_index = excluded.forgejo_index,
+    last_state_hash = excluded.last_state_hash,
+    updated_at = excluded.updated_at`,
+		mapping.RepositoryGitHubID, mapping.GitHubID, mapping.ForgejoID, mapping.GitHubIndex,
+		mapping.ForgejoIndex, mapping.LastStateHash, mapping.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert pull request mapping: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListPullRequestMappings(ctx context.Context, repositoryGitHubID int64) ([]model.PullRequestMapping, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT repository_github_id, github_id, forgejo_id, github_index, forgejo_index, last_state_hash, updated_at
+FROM pull_request_mappings WHERE repository_github_id = ? ORDER BY github_id`, repositoryGitHubID)
+	if err != nil {
+		return nil, fmt.Errorf("list pull request mappings: %w", err)
+	}
+	defer rows.Close()
+	var result []model.PullRequestMapping
+	for rows.Next() {
+		var mapping model.PullRequestMapping
+		var updated string
+		if err := rows.Scan(&mapping.RepositoryGitHubID, &mapping.GitHubID, &mapping.ForgejoID, &mapping.GitHubIndex, &mapping.ForgejoIndex, &mapping.LastStateHash, &updated); err != nil {
+			return nil, fmt.Errorf("scan pull request mapping: %w", err)
+		}
+		mapping.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+		if err != nil {
+			return nil, fmt.Errorf("parse pull request mapping time: %w", err)
+		}
+		result = append(result, mapping)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) UpsertCommentMapping(ctx context.Context, mapping model.CommentMapping) error {
 	if mapping.RepositoryGitHubID <= 0 || mapping.IssueGitHubID <= 0 || mapping.GitHubID <= 0 || mapping.ForgejoID <= 0 || mapping.LastStateHash == "" {
 		return errors.New("comment mapping is incomplete")
@@ -321,6 +376,54 @@ func scanRepository(row scanner) (model.RepositoryMapping, error) {
 	mapping.Archived = archived != 0
 	mapping.UpdatedAt = parsed
 	return mapping, nil
+}
+
+func (s *Store) UpsertReleaseMapping(ctx context.Context, mapping model.ReleaseMapping) error {
+	if mapping.RepositoryGitHubID <= 0 || mapping.GitHubID <= 0 || mapping.ForgejoID <= 0 || mapping.Tag == "" || mapping.LastStateHash == "" {
+		return errors.New("release mapping is incomplete")
+	}
+	if mapping.UpdatedAt.IsZero() {
+		mapping.UpdatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO release_mappings
+    (repository_github_id, github_id, forgejo_id, tag, last_state_hash, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(repository_github_id, github_id) DO UPDATE SET
+    forgejo_id = excluded.forgejo_id,
+    tag = excluded.tag,
+    last_state_hash = excluded.last_state_hash,
+    updated_at = excluded.updated_at`,
+		mapping.RepositoryGitHubID, mapping.GitHubID, mapping.ForgejoID, mapping.Tag,
+		mapping.LastStateHash, mapping.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("upsert release mapping: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListReleaseMappings(ctx context.Context, repositoryGitHubID int64) ([]model.ReleaseMapping, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT repository_github_id, github_id, forgejo_id, tag, last_state_hash, updated_at
+FROM release_mappings WHERE repository_github_id = ? ORDER BY github_id`, repositoryGitHubID)
+	if err != nil {
+		return nil, fmt.Errorf("list release mappings: %w", err)
+	}
+	defer rows.Close()
+	var result []model.ReleaseMapping
+	for rows.Next() {
+		var mapping model.ReleaseMapping
+		var updated string
+		if err := rows.Scan(&mapping.RepositoryGitHubID, &mapping.GitHubID, &mapping.ForgejoID, &mapping.Tag, &mapping.LastStateHash, &updated); err != nil {
+			return nil, fmt.Errorf("scan release mapping: %w", err)
+		}
+		mapping.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+		if err != nil {
+			return nil, fmt.Errorf("parse release mapping time: %w", err)
+		}
+		result = append(result, mapping)
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) ClaimWebhookDelivery(ctx context.Context, forge, deliveryID, eventType, payloadHash string) (bool, error) {

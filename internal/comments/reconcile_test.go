@@ -15,6 +15,7 @@ type fakeComments struct {
 	comments map[int64][]model.Comment
 	created  []model.Comment
 	updated  []model.Comment
+	idBase   int64
 }
 
 func (f *fakeComments) ListComments(_ context.Context, _, _ string, issueIndex int64) ([]model.Comment, error) {
@@ -23,7 +24,10 @@ func (f *fakeComments) ListComments(_ context.Context, _, _ string, issueIndex i
 
 func (f *fakeComments) CreateComment(_ context.Context, _, _ string, issueIndex int64, source model.Comment) (model.Comment, error) {
 	f.created = append(f.created, source)
-	source.ID = 1000 + int64(len(f.created))
+	if f.idBase == 0 {
+		f.idBase = 1000
+	}
+	source.ID = f.idBase + int64(len(f.created))
 	source.IssueID = issueIndex
 	return source, nil
 }
@@ -80,6 +84,64 @@ func TestConcurrentCommentChangesConflict(t *testing.T) {
 	if err != nil || len(conflicts) != 1 || conflicts[0].Kind != "comment" {
 		t.Fatalf("conflicts=%#v err=%v", conflicts, err)
 	}
+}
+
+func TestPullRequestCommentsCopyInBothDirections(t *testing.T) {
+	t.Parallel()
+	store, repository := commentRepository(t)
+	pullRequestMapping := model.PullRequestMapping{
+		RepositoryGitHubID: 1, GitHubID: 111, ForgejoID: 222, GitHubIndex: 5, ForgejoIndex: 7,
+		LastStateHash: "pull", UpdatedAt: time.Now().UTC(),
+	}
+	if err := store.UpsertPullRequestMapping(context.Background(), pullRequestMapping); err != nil {
+		t.Fatal(err)
+	}
+	github := &fakeComments{idBase: 3000, comments: map[int64][]model.Comment{5: {{ID: 11, IssueID: 111, Body: "review"}}}}
+	forgejo := &fakeComments{comments: map[int64][]model.Comment{7: {{ID: 21, IssueID: 222, Body: "forge-side"}}}}
+	reconciler := comments.New(github, forgejo, store)
+
+	if err := reconciler.ReconcilePullRequests(context.Background(), repository, []model.PullRequestMapping{pullRequestMapping}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(forgejo.created) != 1 || forgejo.created[0].Body != "review" {
+		t.Fatalf("forgejo created=%#v", forgejo.created)
+	}
+	if len(github.created) != 1 || github.created[0].Body != "forge-side" {
+		t.Fatalf("github created=%#v", github.created)
+	}
+	created := forgejo.created[0]
+	created.ID = 1001
+	forgejo.comments[7] = append(forgejo.comments[7], created)
+	createdGitHub := github.created[0]
+	createdGitHub.ID = 3001
+	github.comments[5] = append(github.comments[5], createdGitHub)
+	if err := reconciler.ReconcilePullRequests(context.Background(), repository, []model.PullRequestMapping{pullRequestMapping}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(forgejo.created) != 1 || len(github.created) != 1 {
+		t.Fatal("pull request comments bounced on the second reconciliation")
+	}
+	mappings, err := store.ListCommentMappings(context.Background(), 1, 111)
+	if err != nil || len(mappings) != 2 {
+		t.Fatalf("mappings=%#v err=%v", mappings, err)
+	}
+}
+
+func commentRepository(t *testing.T) (*state.Store, model.RepositoryMapping) {
+	t.Helper()
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	repository := model.RepositoryMapping{
+		GitHubID: 1, GitHubFullName: "starintel-labs/example", ForgejoOwner: "starintel-labs", ForgejoName: "example",
+		Visibility: model.VisibilityPrivate, LastStateHash: "repository", UpdatedAt: time.Now().UTC(),
+	}
+	if err := store.UpsertRepository(context.Background(), repository); err != nil {
+		t.Fatal(err)
+	}
+	return store, repository
 }
 
 func commentState(t *testing.T) (*state.Store, model.RepositoryMapping, model.IssueMapping) {

@@ -13,15 +13,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/starintel-labs/forge-sync/internal/api"
 	"github.com/starintel-labs/forge-sync/internal/model"
 )
 
 const maxResponseBody = 32 << 20
 
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL    string
+	uploadBase string
+	token      string
+	http       *http.Client
+	Retry      api.RetryPolicy
 }
 
 type APIError struct {
@@ -36,7 +39,24 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("github API %s %s returned %d (request %s)", e.Method, e.URL, e.StatusCode, e.RequestID)
 }
 
-func New(baseURL, token string, timeout time.Duration) (*Client, error) {
+// Transient reports whether the request may succeed when retried.
+func (e *APIError) Transient() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// RetryDelay returns the server-provided retry delay, if any.
+func (e *APIError) RetryDelay() time.Duration {
+	return e.RetryAfter
+}
+
+type Option func(*Client)
+
+// WithRetry overrides the default bounded retry policy.
+func WithRetry(policy api.RetryPolicy) Option {
+	return func(c *Client) { c.Retry = policy }
+}
+
+func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid GitHub API URL %q", baseURL)
@@ -47,7 +67,23 @@ func New(baseURL, token string, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		return nil, errors.New("GitHub timeout must be positive")
 	}
-	return &Client{baseURL: parsed.String(), token: token, http: &http.Client{Timeout: timeout}}, nil
+	client := &Client{baseURL: parsed.String(), uploadBase: uploadsBase(parsed), token: token, http: &http.Client{Timeout: timeout}, Retry: api.DefaultRetryPolicy()}
+	for _, option := range options {
+		option(client)
+	}
+	if err := client.Retry.Validate(); err != nil {
+		return nil, fmt.Errorf("GitHub retry policy: %w", err)
+	}
+	return client, nil
+}
+
+func uploadsBase(parsed *url.URL) string {
+	if strings.HasPrefix(parsed.Host, "api.") {
+		clone := *parsed
+		clone.Host = "uploads." + strings.TrimPrefix(parsed.Host, "api.")
+		return clone.String()
+	}
+	return parsed.String()
 }
 
 func (c *Client) ListRepositories(ctx context.Context, namespace string) ([]model.Repository, error) {
@@ -79,7 +115,7 @@ func (c *Client) ListIssues(ctx context.Context, owner, name string) ([]model.Is
 		if page >= 1000 {
 			return nil, errors.New("GitHub issue pagination exceeded 1000 pages")
 		}
-		response, err := c.request(ctx, http.MethodGet, endpoint, nil)
+		response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -126,6 +162,99 @@ func (c *Client) UpdateIssue(ctx context.Context, owner, name string, index int6
 	return updated.model(), nil
 }
 
+func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]model.PullRequest, error) {
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls?state=all&per_page=100&page=1"
+	var result []model.PullRequest
+	for page := 0; endpoint != ""; page++ {
+		if page >= 1000 {
+			return nil, errors.New("GitHub pull request pagination exceeded 1000 pages")
+		}
+		response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []pullRequest
+		if err := decode(response.Body, &batch); err != nil {
+			response.Body.Close()
+			return nil, fmt.Errorf("decode GitHub pull requests: %w", err)
+		}
+		response.Body.Close()
+		for _, item := range batch {
+			result = append(result, item.model())
+		}
+		endpoint = nextLink(response.Header.Get("Link"))
+	}
+	return result, nil
+}
+
+func (c *Client) CreatePullRequest(ctx context.Context, owner, name string, source model.PullRequest) (model.PullRequest, error) {
+	payload, err := pullRequestPayload(source, true)
+	if err != nil {
+		return model.PullRequest{}, err
+	}
+	var created pullRequest
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls"
+	if err := c.writeJSON(ctx, http.MethodPost, endpoint, payload, &created); err != nil {
+		return model.PullRequest{}, err
+	}
+	return created.model(), nil
+}
+
+func (c *Client) UpdatePullRequest(ctx context.Context, owner, name string, number int64, source model.PullRequest) (model.PullRequest, error) {
+	payload, err := pullRequestPayload(source, false)
+	if err != nil {
+		return model.PullRequest{}, err
+	}
+	var updated pullRequest
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + strconv.FormatInt(number, 10)
+	if err := c.writeJSON(ctx, http.MethodPatch, endpoint, payload, &updated); err != nil {
+		return model.PullRequest{}, err
+	}
+	return updated.model(), nil
+}
+
+type pullRequest struct {
+	ID        int64     `json:"id"`
+	Number    int64     `json:"number"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	State     string    `json:"state"`
+	Draft     bool      `json:"draft"`
+	Merged    bool      `json:"merged"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Head      struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+func (p pullRequest) model() model.PullRequest {
+	return model.PullRequest{
+		ID: p.ID, Index: p.Number, Title: p.Title, Body: p.Body, State: p.State,
+		Head: p.Head.Ref, Base: p.Base.Ref, Draft: p.Draft, Merged: p.Merged, UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func pullRequestPayload(source model.PullRequest, create bool) (map[string]any, error) {
+	if source.Title == "" || (source.State != "open" && source.State != "closed") || source.Head == "" || source.Base == "" {
+		return nil, errors.New("pull request title, state, head, or base is invalid")
+	}
+	payload := map[string]any{
+		"title": source.Title,
+		"body":  source.Body,
+	}
+	if create {
+		payload["head"] = source.Head
+		payload["base"] = source.Base
+		payload["draft"] = source.Draft
+	} else {
+		payload["state"] = source.State
+	}
+	return payload, nil
+}
+
 func (c *Client) ListComments(ctx context.Context, owner, name string, issueIndex int64) ([]model.Comment, error) {
 	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/issues/" + strconv.FormatInt(issueIndex, 10) + "/comments?per_page=100&page=1"
 	var result []model.Comment
@@ -133,7 +262,7 @@ func (c *Client) ListComments(ctx context.Context, owner, name string, issueInde
 		if page >= 1000 {
 			return nil, errors.New("GitHub comment pagination exceeded 1000 pages")
 		}
-		response, err := c.request(ctx, http.MethodGet, endpoint, nil)
+		response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +363,7 @@ func (c *Client) issuePayload(ctx context.Context, owner, name string, source mo
 
 func (c *Client) ensureLabels(ctx context.Context, owner, name string, names []string) ([]string, error) {
 	root := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/labels"
-	response, err := c.request(ctx, http.MethodGet, root+"?per_page=100&page=1", nil)
+	response, err := c.attempt(ctx, http.MethodGet, root+"?per_page=100&page=1", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +396,7 @@ func (c *Client) ensureLabels(ctx context.Context, owner, name string, names []s
 
 func (c *Client) ensureMilestone(ctx context.Context, owner, name, title string) (int64, error) {
 	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/milestones?state=all&per_page=100"
-	response, err := c.request(ctx, http.MethodGet, endpoint, nil)
+	response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -295,12 +424,148 @@ func (c *Client) ensureMilestone(ctx context.Context, owner, name, title string)
 	return created.Number, nil
 }
 
+func (c *Client) ListReleases(ctx context.Context, owner, name string) ([]model.Release, error) {
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases?per_page=100&page=1"
+	var result []model.Release
+	for page := 0; endpoint != ""; page++ {
+		if page >= 1000 {
+			return nil, errors.New("GitHub release pagination exceeded 1000 pages")
+		}
+		response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		var batch []release
+		if err := decode(response.Body, &batch); err != nil {
+			response.Body.Close()
+			return nil, fmt.Errorf("decode GitHub releases: %w", err)
+		}
+		response.Body.Close()
+		for _, item := range batch {
+			result = append(result, item.model())
+		}
+		endpoint = nextLink(response.Header.Get("Link"))
+	}
+	return result, nil
+}
+
+func (c *Client) CreateRelease(ctx context.Context, owner, name string, source model.Release) (model.Release, error) {
+	var created release
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases"
+	if err := c.writeJSON(ctx, http.MethodPost, endpoint, releasePayload(source), &created); err != nil {
+		return model.Release{}, err
+	}
+	return created.model(), nil
+}
+
+func (c *Client) UpdateRelease(ctx context.Context, owner, name string, id int64, source model.Release) (model.Release, error) {
+	var updated release
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/" + strconv.FormatInt(id, 10)
+	if err := c.writeJSON(ctx, http.MethodPatch, endpoint, releasePayload(source), &updated); err != nil {
+		return model.Release{}, err
+	}
+	return updated.model(), nil
+}
+
+func (c *Client) DownloadReleaseAsset(ctx context.Context, owner, name string, releaseID, assetID int64) ([]byte, error) {
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/assets/" + strconv.FormatInt(assetID, 10)
+	var content []byte
+	err := c.Retry.Do(ctx, func() error {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Accept", "application/octet-stream")
+		request.Header.Set("Authorization", "Bearer "+c.token)
+		request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		response, err := c.http.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
+			return &APIError{Method: http.MethodGet, URL: endpoint, StatusCode: response.StatusCode, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfter: retryAfter(response.Header)}
+		}
+		content, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBody))
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return content, nil
+}
+
+func (c *Client) UploadReleaseAsset(ctx context.Context, owner, name string, releaseID int64, assetName string, content []byte) error {
+	endpoint := c.uploadBase + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/" + strconv.FormatInt(releaseID, 10) + "/assets?name=" + url.QueryEscape(assetName)
+	return c.Retry.Do(ctx, func() error {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(content))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Accept", "application/vnd.github+json")
+		request.Header.Set("Authorization", "Bearer "+c.token)
+		request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		request.Header.Set("Content-Type", "application/octet-stream")
+		request.ContentLength = int64(len(content))
+		response, err := c.http.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
+			return &APIError{Method: http.MethodPost, URL: endpoint, StatusCode: response.StatusCode, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfter: retryAfter(response.Header)}
+		}
+		return nil
+	})
+}
+
+type release struct {
+	ID         int64      `json:"id"`
+	TagName    string     `json:"tag_name"`
+	Name       string     `json:"name"`
+	Body       string     `json:"body"`
+	Draft      bool       `json:"draft"`
+	Prerelease bool       `json:"prerelease"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Assets     []assetRef `json:"assets"`
+}
+
+type assetRef struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+func (r release) model() model.Release {
+	result := model.Release{
+		ID: r.ID, Tag: r.TagName, Name: r.Name, Body: r.Body,
+		Draft: r.Draft, Prerelease: r.Prerelease, CreatedAt: r.CreatedAt,
+	}
+	for _, asset := range r.Assets {
+		result.Assets = append(result.Assets, model.ReleaseAsset{ID: asset.ID, Name: asset.Name, Size: asset.Size})
+	}
+	return result
+}
+
+func releasePayload(source model.Release) map[string]any {
+	return map[string]any{
+		"tag_name":    source.Tag,
+		"name":        source.Name,
+		"body":        source.Body,
+		"draft":       source.Draft,
+		"prerelease":  source.Prerelease,
+		"make_latest": "legacy",
+	}
+}
+
 func (c *Client) writeJSON(ctx context.Context, method, endpoint string, payload, destination any) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	response, err := c.request(ctx, method, endpoint, bytes.NewReader(encoded))
+	response, err := c.attempt(ctx, method, endpoint, func() io.Reader { return bytes.NewReader(encoded) })
 	if err != nil {
 		return err
 	}
@@ -359,7 +624,7 @@ func (c *Client) getAll(ctx context.Context, path string, destination *[]reposit
 			return 0, errors.New("GitHub pagination exceeded 1000 pages")
 		}
 		var repositories []repository
-		response, err := c.request(ctx, http.MethodGet, next, nil)
+		response, err := c.attempt(ctx, http.MethodGet, next, nil)
 		if err != nil {
 			var apiErr *APIError
 			if errors.As(err, &apiErr) {
@@ -400,6 +665,28 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 			Method: method, URL: endpoint, StatusCode: response.StatusCode,
 			RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfter: retryAfter(response.Header),
 		}
+	}
+	return response, nil
+}
+
+// attempt performs a single HTTP request with bounded retry on transient
+// failures. The body factory rebuilds the request body for every attempt.
+func (c *Client) attempt(ctx context.Context, method, endpoint string, body func() io.Reader) (*http.Response, error) {
+	var response *http.Response
+	err := c.Retry.Do(ctx, func() error {
+		var reader io.Reader
+		if body != nil {
+			reader = body()
+		}
+		result, err := c.request(ctx, method, endpoint, reader)
+		if err != nil {
+			return err
+		}
+		response = result
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return response, nil
 }

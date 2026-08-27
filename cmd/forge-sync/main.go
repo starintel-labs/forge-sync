@@ -20,7 +20,9 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/github"
 	"github.com/starintel-labs/forge-sync/internal/gitrefs"
 	"github.com/starintel-labs/forge-sync/internal/issues"
+	"github.com/starintel-labs/forge-sync/internal/pullrequests"
 	"github.com/starintel-labs/forge-sync/internal/reconcile"
+	"github.com/starintel-labs/forge-sync/internal/releases"
 	"github.com/starintel-labs/forge-sync/internal/repository"
 	"github.com/starintel-labs/forge-sync/internal/state"
 	"github.com/starintel-labs/forge-sync/internal/webhooks"
@@ -136,9 +138,11 @@ func openRuntime(cfg config.Config) (*application, error) {
 	repositories := repository.New(githubClient, forgejoClient, store, cfg.GitHubToken)
 	issueReconciler := issues.New(githubClient, forgejoClient, store)
 	commentReconciler := comments.New(githubClient, forgejoClient, store)
+	pullRequestReconciler := pullrequests.New(githubClient, forgejoClient, store)
+	releaseReconciler := releases.New(githubClient, forgejoClient, store)
 	gitSynchronizer := gitrefs.NewSynchronizer(store, cfg.GitTimeout)
 	engine := reconcile.New(
-		repositories, issueReconciler, commentReconciler, gitSynchronizer, store,
+		repositories, issueReconciler, commentReconciler, pullRequestReconciler, releaseReconciler, gitSynchronizer, store,
 		cfg.Namespaces, cfg.GitHubToken, cfg.ForgejoToken, cfg.ForgejoAPI, cfg.MaxConcurrency,
 	)
 	return &application{store: store, engine: engine}, nil
@@ -173,8 +177,8 @@ func serve(cfg config.Config, runtime *application) error {
 		}
 		response.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = fmt.Fprintf(response,
-			"forge_sync_repositories %d\nforge_sync_issues %d\nforge_sync_comments %d\nforge_sync_conflicts %d\nforge_sync_webhook_deliveries %d\nforge_sync_reconciliation_runs %d\n",
-			stats.Repositories, stats.Issues, stats.Comments, stats.Conflicts, stats.Deliveries, stats.Runs)
+			"forge_sync_repositories %d\nforge_sync_issues %d\nforge_sync_pull_requests %d\nforge_sync_comments %d\nforge_sync_releases %d\nforge_sync_conflicts %d\nforge_sync_webhook_deliveries %d\nforge_sync_reconciliation_runs %d\n",
+			stats.Repositories, stats.Issues, stats.PullRequests, stats.Comments, stats.Releases, stats.Conflicts, stats.Deliveries, stats.Runs)
 	})
 	server := &http.Server{
 		Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second,

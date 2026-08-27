@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/starintel-labs/forge-sync/internal/api"
 	"github.com/starintel-labs/forge-sync/internal/model"
 )
 
@@ -21,19 +24,38 @@ type Client struct {
 	baseURL string
 	token   string
 	http    *http.Client
+	Retry   api.RetryPolicy
 }
 
 type APIError struct {
 	Method     string
 	URL        string
 	StatusCode int
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("Forgejo API %s %s returned %d", e.Method, e.URL, e.StatusCode)
 }
 
-func New(baseURL, token string, timeout time.Duration) (*Client, error) {
+// Transient reports whether the request may succeed when retried.
+func (e *APIError) Transient() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// RetryDelay returns the server-provided retry delay, if any.
+func (e *APIError) RetryDelay() time.Duration {
+	return e.RetryAfter
+}
+
+type Option func(*Client)
+
+// WithRetry overrides the default bounded retry policy.
+func WithRetry(policy api.RetryPolicy) Option {
+	return func(c *Client) { c.Retry = policy }
+}
+
+func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid Forgejo API URL %q", baseURL)
@@ -44,7 +66,14 @@ func New(baseURL, token string, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		return nil, errors.New("Forgejo timeout must be positive")
 	}
-	return &Client{baseURL: parsed.String(), token: token, http: &http.Client{Timeout: timeout}}, nil
+	client := &Client{baseURL: parsed.String(), token: token, http: &http.Client{Timeout: timeout}, Retry: api.DefaultRetryPolicy()}
+	for _, option := range options {
+		option(client)
+	}
+	if err := client.Retry.Validate(); err != nil {
+		return nil, fmt.Errorf("Forgejo retry policy: %w", err)
+	}
+	return client, nil
 }
 
 func (c *Client) ListRepositories(ctx context.Context, namespace string) ([]model.Repository, error) {
@@ -118,6 +147,90 @@ func (c *Client) UpdateIssue(ctx context.Context, owner, name string, index int6
 		updated.Labels = append(updated.Labels, label{ID: id, Name: source.Labels[i]})
 	}
 	return updated.model(), nil
+}
+
+func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]model.PullRequest, error) {
+	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls?state=all&limit=50"
+	var result []model.PullRequest
+	for page := 1; page <= 1000; page++ {
+		var batch []pullRequest
+		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch); err != nil {
+			return nil, err
+		}
+		for _, item := range batch {
+			result = append(result, item.model())
+		}
+		if len(batch) < 50 {
+			return result, nil
+		}
+	}
+	return nil, errors.New("Forgejo pull request pagination exceeded 1000 pages")
+}
+
+func (c *Client) CreatePullRequest(ctx context.Context, owner, name string, source model.PullRequest) (model.PullRequest, error) {
+	payload, err := pullRequestPayload(source, true)
+	if err != nil {
+		return model.PullRequest{}, err
+	}
+	var created pullRequest
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls"
+	if _, err := c.doJSON(ctx, http.MethodPost, endpoint, payload, &created); err != nil {
+		return model.PullRequest{}, err
+	}
+	return created.model(), nil
+}
+
+func (c *Client) UpdatePullRequest(ctx context.Context, owner, name string, index int64, source model.PullRequest) (model.PullRequest, error) {
+	payload, err := pullRequestPayload(source, false)
+	if err != nil {
+		return model.PullRequest{}, err
+	}
+	var updated pullRequest
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + fmt.Sprint(index)
+	if _, err := c.doJSON(ctx, http.MethodPatch, endpoint, payload, &updated); err != nil {
+		return model.PullRequest{}, err
+	}
+	return updated.model(), nil
+}
+
+type pullRequest struct {
+	ID        int64     `json:"id"`
+	Index     int64     `json:"index"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body"`
+	State     string    `json:"state"`
+	Merged    bool      `json:"merged"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Head      struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+func (p pullRequest) model() model.PullRequest {
+	return model.PullRequest{
+		ID: p.ID, Index: p.Index, Title: p.Title, Body: p.Body, State: p.State,
+		Head: p.Head.Ref, Base: p.Base.Ref, Merged: p.Merged, UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func pullRequestPayload(source model.PullRequest, create bool) (map[string]any, error) {
+	if source.Title == "" || (source.State != "open" && source.State != "closed") || source.Head == "" || source.Base == "" {
+		return nil, errors.New("pull request title, state, head, or base is invalid")
+	}
+	payload := map[string]any{
+		"title": source.Title,
+		"body":  source.Body,
+	}
+	if create {
+		payload["head"] = source.Head
+		payload["base"] = source.Base
+	} else {
+		payload["state"] = source.State
+	}
+	return payload, nil
 }
 
 func (c *Client) ListComments(ctx context.Context, owner, name string, issueIndex int64) ([]model.Comment, error) {
@@ -269,6 +382,146 @@ func (c *Client) ensureMilestone(ctx context.Context, owner, name, title string)
 	return created.ID, nil
 }
 
+func (c *Client) ListReleases(ctx context.Context, owner, name string) ([]model.Release, error) {
+	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases?limit=50&draft=true&pre-release=true"
+	var result []model.Release
+	for page := 1; page <= 1000; page++ {
+		var batch []release
+		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch); err != nil {
+			return nil, err
+		}
+		for _, item := range batch {
+			result = append(result, item.model())
+		}
+		if len(batch) < 50 {
+			return result, nil
+		}
+	}
+	return nil, errors.New("Forgejo release pagination exceeded 1000 pages")
+}
+
+func (c *Client) CreateRelease(ctx context.Context, owner, name string, source model.Release) (model.Release, error) {
+	var created release
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases"
+	if _, err := c.doJSON(ctx, http.MethodPost, endpoint, releasePayload(source), &created); err != nil {
+		return model.Release{}, err
+	}
+	return created.model(), nil
+}
+
+func (c *Client) UpdateRelease(ctx context.Context, owner, name string, id int64, source model.Release) (model.Release, error) {
+	var updated release
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/" + fmt.Sprint(id)
+	payload := releasePayload(source)
+	delete(payload, "tag_name")
+	if _, err := c.doJSON(ctx, http.MethodPatch, endpoint, payload, &updated); err != nil {
+		return model.Release{}, err
+	}
+	return updated.model(), nil
+}
+
+func (c *Client) DownloadReleaseAsset(ctx context.Context, owner, name string, releaseID, assetID int64) ([]byte, error) {
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/" + fmt.Sprint(releaseID) + "/assets/" + fmt.Sprint(assetID)
+	var content []byte
+	err := c.Retry.Do(ctx, func() error {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Accept", "application/octet-stream")
+		request.Header.Set("Authorization", "token "+c.token)
+		response, err := c.http.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
+			return &APIError{Method: http.MethodGet, URL: endpoint, StatusCode: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+		}
+		content, err = io.ReadAll(io.LimitReader(response.Body, maxResponseBody))
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return content, nil
+}
+
+func (c *Client) UploadReleaseAsset(ctx context.Context, owner, name string, releaseID int64, assetName string, content []byte) error {
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases/" + fmt.Sprint(releaseID) + "/assets?name=" + url.QueryEscape(assetName)
+	return c.Retry.Do(ctx, func() error {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		file, err := writer.CreateFormFile("attachment", assetName)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(content); err != nil {
+			return err
+		}
+		if err := writer.Close(); err != nil {
+			return err
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Authorization", "token "+c.token)
+		request.Header.Set("Content-Type", writer.FormDataContentType())
+		response, err := c.http.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
+			return &APIError{Method: http.MethodPost, URL: endpoint, StatusCode: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+		}
+		return nil
+	})
+}
+
+type release struct {
+	ID         int64      `json:"id"`
+	TagName    string     `json:"tag_name"`
+	Name       string     `json:"name"`
+	Body       string     `json:"body"`
+	Draft      bool       `json:"draft"`
+	Prerelease bool       `json:"prerelease"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Assets     []assetRef `json:"attachments"`
+}
+
+type assetRef struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+func (r release) model() model.Release {
+	result := model.Release{
+		ID: r.ID, Tag: r.TagName, Name: r.Name, Body: r.Body,
+		Draft: r.Draft, Prerelease: r.Prerelease, CreatedAt: r.CreatedAt,
+	}
+	for _, asset := range r.Assets {
+		result.Assets = append(result.Assets, model.ReleaseAsset{ID: asset.ID, Name: asset.Name, Size: asset.Size})
+	}
+	return result
+}
+
+func releasePayload(source model.Release) map[string]any {
+	return map[string]any{
+		"tag_name":           source.Tag,
+		"name":               source.Name,
+		"body":               source.Body,
+		"draft":              source.Draft,
+		"prerelease":         source.Prerelease,
+		"hide_archive_links": false,
+	}
+}
+
 func (c *Client) listRepositories(ctx context.Context, path string) ([]repository, int, error) {
 	var result []repository
 	for page := 1; page <= 1000; page++ {
@@ -390,36 +643,48 @@ func (r repository) model() model.Repository {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, requestBody, responseBody any) (int, error) {
-	var body io.Reader
-	if requestBody != nil {
-		encoded, err := json.Marshal(requestBody)
+	var status int
+	err := c.Retry.Do(ctx, func() error {
+		var body io.Reader
+		if requestBody != nil {
+			encoded, err := json.Marshal(requestBody)
+			if err != nil {
+				return err
+			}
+			body = bytes.NewReader(encoded)
+		}
+		request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 		if err != nil {
-			return 0, err
+			return err
 		}
-		body = bytes.NewReader(encoded)
-	}
-	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
-	if err != nil {
-		return 0, err
-	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Authorization", "token "+c.token)
-	if requestBody != nil {
-		request.Header.Set("Content-Type", "application/json")
-	}
-	response, err := c.http.Do(request)
-	if err != nil {
-		return 0, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
-		return response.StatusCode, &APIError{Method: method, URL: endpoint, StatusCode: response.StatusCode}
-	}
-	if responseBody != nil {
-		if err := json.NewDecoder(io.LimitReader(response.Body, maxResponseBody)).Decode(responseBody); err != nil {
-			return response.StatusCode, fmt.Errorf("decode Forgejo response: %w", err)
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("Authorization", "token "+c.token)
+		if requestBody != nil {
+			request.Header.Set("Content-Type", "application/json")
 		}
+		response, err := c.http.Do(request)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
+			return &APIError{Method: method, URL: endpoint, StatusCode: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+		}
+		if responseBody != nil {
+			if err := json.NewDecoder(io.LimitReader(response.Body, maxResponseBody)).Decode(responseBody); err != nil {
+				return fmt.Errorf("decode Forgejo response: %w", err)
+			}
+		}
+		status = response.StatusCode
+		return nil
+	})
+	return status, err
+}
+
+func retryAfter(header http.Header) time.Duration {
+	if seconds, err := strconv.Atoi(header.Get("Retry-After")); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
 	}
-	return response.StatusCode, nil
+	return 0
 }

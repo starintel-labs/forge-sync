@@ -93,6 +93,32 @@ type CommentMapping struct {
 	UpdatedAt          time.Time
 }
 
+type Release struct {
+	ID         int64
+	Tag        string
+	Name       string
+	Body       string
+	Draft      bool
+	Prerelease bool
+	CreatedAt  time.Time
+	Assets     []ReleaseAsset
+}
+
+type ReleaseAsset struct {
+	ID   int64
+	Name string
+	Size int64
+}
+
+type ReleaseMapping struct {
+	RepositoryGitHubID int64
+	GitHubID           int64
+	ForgejoID          int64
+	Tag                string
+	LastStateHash      string
+	UpdatedAt          time.Time
+}
+
 type Ref struct {
 	Name string
 	SHA  string

@@ -14,6 +14,8 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/gitrefs"
 	"github.com/starintel-labs/forge-sync/internal/issues"
 	"github.com/starintel-labs/forge-sync/internal/model"
+	"github.com/starintel-labs/forge-sync/internal/pullrequests"
+	"github.com/starintel-labs/forge-sync/internal/releases"
 	"github.com/starintel-labs/forge-sync/internal/repository"
 	"github.com/starintel-labs/forge-sync/internal/state"
 )
@@ -33,6 +35,8 @@ type Engine struct {
 	repositories     *repository.Reconciler
 	issues           *issues.Reconciler
 	comments         *comments.Reconciler
+	pullRequests     *pullrequests.Reconciler
+	releases         *releases.Reconciler
 	git              *gitrefs.Synchronizer
 	store            *state.Store
 	namespaces       []string
@@ -43,12 +47,14 @@ type Engine struct {
 	locks            sync.Map
 }
 
-func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int) *Engine {
-	if repositories == nil || issueReconciler == nil || commentReconciler == nil || git == nil || store == nil || len(namespaces) == 0 || githubToken == "" || forgejoToken == "" || maxConcurrency < 1 {
+func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, pullRequestReconciler *pullrequests.Reconciler, releaseReconciler *releases.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int) *Engine {
+	if repositories == nil || issueReconciler == nil || commentReconciler == nil || pullRequestReconciler == nil || releaseReconciler == nil || git == nil || store == nil || len(namespaces) == 0 || githubToken == "" || forgejoToken == "" || maxConcurrency < 1 {
 		panic("reconciliation engine configuration is incomplete")
 	}
 	return &Engine{
-		repositories: repositories, issues: issueReconciler, comments: commentReconciler, git: git, store: store,
+		repositories: repositories, issues: issueReconciler, comments: commentReconciler,
+		pullRequests: pullRequestReconciler, releases: releaseReconciler,
+		git: git, store: store,
 		namespaces: append([]string(nil), namespaces...), githubToken: githubToken, forgejoToken: forgejoToken,
 		forgejoCloneBase: strings.TrimSuffix(strings.TrimRight(forgejoAPI, "/"), "/api/v1"), maxConcurrency: maxConcurrency,
 	}
@@ -194,6 +200,19 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 	}
 	if err := e.comments.Reconcile(ctx, mapping, issueMappings, dryRun); err != nil {
 		return RepositoryResult{}, fmt.Errorf("synchronize comments for %s: %w", mapping.GitHubFullName, err)
+	}
+	if err := e.pullRequests.Reconcile(ctx, mapping, dryRun); err != nil {
+		return RepositoryResult{}, fmt.Errorf("synchronize pull requests for %s: %w", mapping.GitHubFullName, err)
+	}
+	pullRequestMappings, err := e.store.ListPullRequestMappings(ctx, mapping.GitHubID)
+	if err != nil {
+		return RepositoryResult{}, err
+	}
+	if err := e.comments.ReconcilePullRequests(ctx, mapping, pullRequestMappings, dryRun); err != nil {
+		return RepositoryResult{}, fmt.Errorf("synchronize pull request comments for %s: %w", mapping.GitHubFullName, err)
+	}
+	if err := e.releases.Reconcile(ctx, mapping, dryRun); err != nil {
+		return RepositoryResult{}, fmt.Errorf("synchronize releases for %s: %w", mapping.GitHubFullName, err)
 	}
 	return RepositoryResult{Repository: mapping.GitHubFullName, Actions: gitResult.Actions, Conflicts: len(gitResult.Conflicts)}, nil
 }
