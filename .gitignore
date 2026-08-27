@@ -1,0 +1,6 @@
+/forge-sync
+/result
+/coverage.out
+/*.db
+/*.db-shm
+/*.db-wal
