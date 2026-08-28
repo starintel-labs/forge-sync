@@ -162,6 +162,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 		}
 	}
 
+	// Migration rewrites release bodies; tags are stable identity. Pair the
+	// remainder by unique tag, recording the Forgejo state as baseline.
+	tagGitHub, _ := tagPairs(unconsumed(githubReleases, consumedGitHub), unconsumed(forgejoReleases, consumedForgejo))
+	for githubID, forgejoID := range tagGitHub {
+		githubRelease, forgejoRelease := githubByID[githubID], forgejoByID[forgejoID]
+		consumedGitHub[githubID], consumedForgejo[forgejoID] = true, true
+		if !dryRun {
+			mapping := releaseMapping(repository.GitHubID, githubRelease, forgejoRelease)
+			mapping.LastStateHash = Hash(forgejoRelease)
+			if err := r.store.UpsertReleaseMapping(ctx, mapping); err != nil {
+				return err
+			}
+		}
+	}
+
 	for _, githubRelease := range unconsumed(githubReleases, consumedGitHub) {
 		if dryRun {
 			continue
@@ -315,6 +330,30 @@ func uniqueHashPairs(githubReleases, forgejoReleases []model.Release) (map[int64
 			githubPairs[githubIDs[0]] = forgejoIDs[0]
 			forgejoPairs[forgejoIDs[0]] = githubIDs[0]
 		}
+	}
+	return githubPairs, forgejoPairs
+}
+
+// tagPairs pairs leftovers by unique tag name; see the issues reconciler for
+// why migrations require this recovery pass.
+func tagPairs(githubReleases, forgejoReleases []model.Release) (map[int64]int64, map[int64]int64) {
+	githubByTag := map[string][]model.Release{}
+	forgejoByTag := map[string][]model.Release{}
+	for _, release := range githubReleases {
+		githubByTag[release.Tag] = append(githubByTag[release.Tag], release)
+	}
+	for _, release := range forgejoReleases {
+		forgejoByTag[release.Tag] = append(forgejoByTag[release.Tag], release)
+	}
+	githubPairs := map[int64]int64{}
+	forgejoPairs := map[int64]int64{}
+	for tag, githubMatches := range githubByTag {
+		forgejoMatches := forgejoByTag[tag]
+		if len(githubMatches) != 1 || len(forgejoMatches) != 1 {
+			continue
+		}
+		githubPairs[githubMatches[0].ID] = forgejoMatches[0].ID
+		forgejoPairs[forgejoMatches[0].ID] = githubMatches[0].ID
 	}
 	return githubPairs, forgejoPairs
 }

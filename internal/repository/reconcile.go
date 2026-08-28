@@ -30,17 +30,29 @@ type Reconciler struct {
 	forgejo     Forgejo
 	store       *state.Store
 	githubToken string
+	ownerMap    map[string]string
 }
 
-func New(github GitHub, forgejo Forgejo, store *state.Store, githubToken string) *Reconciler {
+// New builds a repository reconciler. ownerMap optionally redirects GitHub
+// namespaces to different Forgejo owners (for example
+// "starintel-labs:nsaspy"); a nil map keeps namespace identities.
+func New(github GitHub, forgejo Forgejo, store *state.Store, githubToken string, ownerMap map[string]string) *Reconciler {
 	if github == nil || forgejo == nil || store == nil || githubToken == "" {
 		panic("repository reconciler requires clients, state, and GitHub token")
 	}
-	return &Reconciler{github: github, forgejo: forgejo, store: store, githubToken: githubToken}
+	return &Reconciler{github: github, forgejo: forgejo, store: store, githubToken: githubToken, ownerMap: ownerMap}
+}
+
+func (r *Reconciler) forgejoOwner(namespace string) string {
+	if owner, ok := r.ownerMap[namespace]; ok && owner != "" {
+		return owner
+	}
+	return namespace
 }
 
 func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun bool) (model.Inventory, error) {
 	var inventory model.Inventory
+	countedForgejo := map[string]bool{}
 	for _, namespace := range namespaces {
 		if namespace != "starintel-labs" && namespace != "lost-rob0t" {
 			return inventory, fmt.Errorf("namespace %q is outside the allowed set", namespace)
@@ -49,41 +61,53 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 		if err != nil {
 			return inventory, fmt.Errorf("enumerate GitHub namespace %s: %w", namespace, err)
 		}
-		forgejoRepositories, err := r.forgejo.ListRepositories(ctx, namespace)
+		forgejoOwner := r.forgejoOwner(namespace)
+		forgejoRepositories, err := r.forgejo.ListRepositories(ctx, forgejoOwner)
 		if err != nil {
-			return inventory, fmt.Errorf("enumerate Forgejo namespace %s: %w", namespace, err)
+			return inventory, fmt.Errorf("enumerate Forgejo owner %s: %w", forgejoOwner, err)
 		}
 		inventory.GitHubRepositories += len(githubRepositories)
-		inventory.ForgejoRepositories += len(forgejoRepositories)
+		if !countedForgejo[forgejoOwner] {
+			countedForgejo[forgejoOwner] = true
+			inventory.ForgejoRepositories += len(forgejoRepositories)
+		}
 		forgejoByName := make(map[string]model.Repository, len(forgejoRepositories))
 		for _, repository := range forgejoRepositories {
 			forgejoByName[strings.ToLower(repository.FullName)] = repository
 		}
 		for _, source := range githubRepositories {
-			if err := validateRepository(source, namespace); err != nil {
+			if err := validateRepository(source); err != nil {
 				return inventory, err
+			}
+			// GitHub's type=all listings include collaborator and org-member
+			// repositories; only repositories owned by the namespace sync.
+			if source.Owner != namespace {
+				continue
 			}
 			mapping, mapped, err := r.store.RepositoryByGitHubID(ctx, source.ID)
 			if err != nil {
 				return inventory, err
 			}
+			target := source
+			target.Owner = forgejoOwner
+			target.FullName = forgejoOwner + "/" + source.Name
 			if mapped {
-				if mapping.ForgejoOwner != source.Owner || mapping.ForgejoName != source.Name {
+				if mapping.ForgejoOwner != target.Owner || mapping.ForgejoName != target.Name {
 					if !dryRun {
-						if err := r.forgejo.UpdateRepositoryIdentity(ctx, mapping.ForgejoOwner, mapping.ForgejoName, source.Owner, source.Name); err != nil {
+						if err := r.forgejo.UpdateRepositoryIdentity(ctx, mapping.ForgejoOwner, mapping.ForgejoName, target.Owner, target.Name); err != nil {
 							return inventory, fmt.Errorf("update identity for GitHub repository %d: %w", source.ID, err)
 						}
 					}
 				}
 				if mapping.Visibility != source.Visibility || mapping.Archived != source.Archived {
 					if !dryRun {
-						if err := r.forgejo.UpdateRepositorySettings(ctx, source); err != nil {
+						if err := r.forgejo.UpdateRepositorySettings(ctx, target); err != nil {
 							return inventory, fmt.Errorf("update settings for %s: %w", source.FullName, err)
 						}
 					}
 				}
 				if !dryRun {
-					if err := r.store.UpsertRepository(ctx, mappingFor(source)); err != nil {
+					if err := r.store.UpsertRepository(ctx, mappingForPair(source, target.Owner, target.Name)); err != nil {
 						return inventory, err
 					}
 				}
@@ -91,16 +115,16 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 				continue
 			}
 
-			if target, exists := forgejoByName[strings.ToLower(source.FullName)]; exists {
-				if target.Visibility == model.VisibilityPublic && source.Visibility != model.VisibilityPublic {
+			if existing, exists := forgejoByName[strings.ToLower(target.FullName)]; exists {
+				if existing.Visibility == model.VisibilityPublic && source.Visibility != model.VisibilityPublic {
 					if !dryRun {
-						if err := r.forgejo.UpdateRepositorySettings(ctx, source); err != nil {
-							return inventory, fmt.Errorf("fail closed existing repository %s: %w", source.FullName, err)
+						if err := r.forgejo.UpdateRepositorySettings(ctx, target); err != nil {
+							return inventory, fmt.Errorf("fail closed existing repository %s: %w", target.FullName, err)
 						}
 					}
 				}
 				if !dryRun {
-					if err := r.store.UpsertRepository(ctx, mappingFor(source)); err != nil {
+					if err := r.store.UpsertRepository(ctx, mappingForPair(source, existing.Owner, existing.Name)); err != nil {
 						return inventory, err
 					}
 				}
@@ -112,11 +136,23 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 			if dryRun {
 				continue
 			}
-			if _, err := r.forgejo.MigrateRepository(ctx, source, r.githubToken); err != nil {
+			migrated, err := r.forgejo.MigrateRepository(ctx, target, r.githubToken)
+			if err != nil {
 				return inventory, err
 			}
-			if err := r.store.UpsertRepository(ctx, mappingFor(source)); err != nil {
-				return inventory, err
+			if !dryRun {
+				// GitHub identity comes from discovery only; the migration
+				// response defines the Forgejo side.
+				mapping := mappingFor(migrated)
+				mapping.GitHubID = source.ID
+				mapping.GitHubFullName = source.FullName
+				mapping.ForgejoOwner = target.Owner
+				mapping.ForgejoName = target.Name
+				mapping.Visibility = source.Visibility
+				mapping.Archived = source.Archived
+				if err := r.store.UpsertRepository(ctx, mapping); err != nil {
+					return inventory, err
+				}
 			}
 		}
 	}
@@ -126,6 +162,17 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 	}
 	inventory.Conflicted = len(conflicts)
 	return inventory, nil
+}
+
+// mappingForPair records a mapping whose GitHub identity is canonical and
+// whose Forgejo identity is the (possibly redirected) target owner/name.
+func mappingForPair(source model.Repository, forgejoOwner, forgejoName string) model.RepositoryMapping {
+	return model.RepositoryMapping{
+		GitHubID: source.ID, GitHubFullName: source.FullName,
+		ForgejoOwner: forgejoOwner, ForgejoName: forgejoName,
+		Visibility: source.Visibility, Archived: source.Archived,
+		LastStateHash: repositoryHash(source), UpdatedAt: time.Now().UTC(),
+	}
 }
 
 func mappingFor(repository model.Repository) model.RepositoryMapping {
@@ -152,15 +199,12 @@ func repositoryHash(repository model.Repository) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func validateRepository(repository model.Repository, namespace string) error {
+func validateRepository(repository model.Repository) error {
 	if repository.ID <= 0 || repository.Name == "" || repository.FullName == "" || repository.Owner == "" {
 		return errors.New("GitHub returned an incomplete repository")
 	}
-	if repository.Owner != namespace || repository.FullName != repository.Owner+"/"+repository.Name {
-		return fmt.Errorf("GitHub repository %q escaped configured namespace %q", repository.FullName, namespace)
-	}
-	if repository.Visibility != model.VisibilityPrivate && repository.Visibility != model.VisibilityInternal && repository.Visibility != model.VisibilityPublic {
-		repository.Visibility = model.VisibilityPrivate
+	if repository.FullName != repository.Owner+"/"+repository.Name {
+		return fmt.Errorf("GitHub repository %q has a malformed full name", repository.FullName)
 	}
 	return nil
 }

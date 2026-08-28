@@ -65,7 +65,7 @@ func TestDryRunInventoriesMissingRepositoryWithoutMutation(t *testing.T) {
 		"starintel-labs": {{ID: 1, Owner: "starintel-labs", Name: "new", FullName: "starintel-labs/new", Visibility: model.VisibilityPrivate}},
 	}}
 	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{"starintel-labs": {}}}
-	reconciler := repository.New(github, forgejo, store, "github-token")
+	reconciler := repository.New(github, forgejo, store, "github-token", nil)
 
 	inventory, err := reconciler.Discover(context.Background(), []string{"starintel-labs"}, true)
 	if err != nil {
@@ -89,7 +89,7 @@ func TestDiscoverImportsNewRepositoryAndPersistsStableID(t *testing.T) {
 		"starintel-labs": {{ID: 7, Owner: "starintel-labs", Name: "new", FullName: "starintel-labs/new", Visibility: model.VisibilityPrivate}},
 	}}
 	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{"starintel-labs": {}}}
-	reconciler := repository.New(github, forgejo, store, "github-token")
+	reconciler := repository.New(github, forgejo, store, "github-token", nil)
 
 	if _, err := reconciler.Discover(context.Background(), []string{"starintel-labs"}, false); err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestStableIDDetectsRenameAndTransfer(t *testing.T) {
 	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{
 		"lost-rob0t": {},
 	}}
-	reconciler := repository.New(github, forgejo, store, "github-token")
+	reconciler := repository.New(github, forgejo, store, "github-token", nil)
 
 	if _, err := reconciler.Discover(context.Background(), []string{"lost-rob0t"}, false); err != nil {
 		t.Fatal(err)
@@ -132,12 +132,87 @@ func TestStableIDDetectsRenameAndTransfer(t *testing.T) {
 	}
 }
 
+func TestOwnerMapRedirectsMigrationAndMatching(t *testing.T) {
+	t.Parallel()
+	store := openStore(t)
+	github := &fakeGitHub{repositories: map[string][]model.Repository{
+		"starintel-labs": {{ID: 7, Owner: "starintel-labs", Name: "new", FullName: "starintel-labs/new", CloneURL: "https://github.com/starintel-labs/new.git", Visibility: model.VisibilityPrivate}},
+	}}
+	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{"nsaspy": {}}}
+	reconciler := repository.New(github, forgejo, store, "github-token", map[string]string{"starintel-labs": "nsaspy"})
+
+	if _, err := reconciler.Discover(context.Background(), []string{"starintel-labs"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(forgejo.migrated) != 1 || forgejo.migrated[0].Owner != "nsaspy" || forgejo.migrated[0].Name != "new" {
+		t.Fatalf("migrated=%#v", forgejo.migrated)
+	}
+	if forgejo.migrated[0].CloneURL != "https://github.com/starintel-labs/new.git" {
+		t.Fatalf("clone URL was rewritten: %#v", forgejo.migrated[0])
+	}
+	mapping, found, err := store.RepositoryByGitHubID(context.Background(), 7)
+	if err != nil || !found || mapping.ForgejoOwner != "nsaspy" || mapping.GitHubFullName != "starintel-labs/new" {
+		t.Fatalf("mapping=%#v found=%v err=%v", mapping, found, err)
+	}
+}
+
+func TestOwnerMapPairsPreexistingRepositoryUnderMappedOwner(t *testing.T) {
+	t.Parallel()
+	store := openStore(t)
+	github := &fakeGitHub{repositories: map[string][]model.Repository{
+		"lost-rob0t": {{ID: 9, Owner: "lost-rob0t", Name: "tools", FullName: "lost-rob0t/tools", Visibility: model.VisibilityPrivate}},
+	}}
+	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{
+		"nsaspy": {{ID: 90, Owner: "nsaspy", Name: "tools", FullName: "nsaspy/tools", Visibility: model.VisibilityPrivate}},
+	}}
+	reconciler := repository.New(github, forgejo, store, "github-token", map[string]string{"lost-rob0t": "nsaspy"})
+
+	inventory, err := reconciler.Discover(context.Background(), []string{"lost-rob0t"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.Missing != 0 || inventory.InSync != 1 || len(forgejo.migrated) != 0 {
+		t.Fatalf("inventory=%#v migrated=%d", inventory, len(forgejo.migrated))
+	}
+	mapping, found, err := store.RepositoryByGitHubID(context.Background(), 9)
+	if err != nil || !found || mapping.ForgejoOwner != "nsaspy" {
+		t.Fatalf("mapping=%#v found=%v err=%v", mapping, found, err)
+	}
+}
+
+func TestOwnedForksSyncButCollaboratorRepositoriesDoNot(t *testing.T) {
+	t.Parallel()
+	store := openStore(t)
+	github := &fakeGitHub{repositories: map[string][]model.Repository{
+		"lost-rob0t": {
+			{ID: 21, Owner: "lost-rob0t", Name: "vim-fork", FullName: "lost-rob0t/vim-fork", CloneURL: "https://github.com/lost-rob0t/vim-fork.git", Visibility: model.VisibilityPublic},
+			{ID: 22, Owner: "Papurudoragon", Name: "bountyforone", FullName: "Papurudoragon/bountyforone", CloneURL: "https://github.com/Papurudoragon/bountyforone.git", Visibility: model.VisibilityPrivate},
+		},
+	}}
+	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{"nsaspy": {}}}
+	reconciler := repository.New(github, forgejo, store, "github-token", map[string]string{"lost-rob0t": "nsaspy"})
+
+	inventory, err := reconciler.Discover(context.Background(), []string{"lost-rob0t"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forgejo.migrated) != 1 || forgejo.migrated[0].Name != "vim-fork" {
+		t.Fatalf("migrated=%#v", forgejo.migrated)
+	}
+	if inventory.GitHubRepositories != 2 || inventory.Missing != 1 || inventory.InSync != 0 {
+		t.Fatalf("inventory=%#v", inventory)
+	}
+	if _, found, _ := store.RepositoryByGitHubID(context.Background(), 22); found {
+		t.Fatal("collaborator repository was mapped")
+	}
+}
+
 func TestAPIFailureNeverBecomesRepositoryDeletionOrImport(t *testing.T) {
 	t.Parallel()
 	store := openStore(t)
 	github := &fakeGitHub{err: errors.New("rate limited")}
 	forgejo := &fakeForgejo{repositories: map[string][]model.Repository{"starintel-labs": {}}}
-	reconciler := repository.New(github, forgejo, store, "github-token")
+	reconciler := repository.New(github, forgejo, store, "github-token", nil)
 	if _, err := reconciler.Discover(context.Background(), []string{"starintel-labs"}, false); err == nil {
 		t.Fatal("API failure was accepted")
 	}

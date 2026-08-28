@@ -191,6 +191,25 @@ FROM repository_mappings WHERE github_id = ?`, githubID)
 	return mapping, true, nil
 }
 
+func (s *Store) RepositoriesByForgejoPath(ctx context.Context, owner, name string) ([]model.RepositoryMapping, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at
+FROM repository_mappings WHERE lower(forgejo_owner) = lower(?) AND lower(forgejo_name) = lower(?) ORDER BY github_full_name`, owner, name)
+	if err != nil {
+		return nil, fmt.Errorf("find repository mappings by Forgejo path: %w", err)
+	}
+	defer rows.Close()
+	var result []model.RepositoryMapping
+	for rows.Next() {
+		mapping, err := scanRepository(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan repository mapping: %w", err)
+		}
+		result = append(result, mapping)
+	}
+	return result, rows.Err()
+}
+
 func (s *Store) ListRepositories(ctx context.Context) ([]model.RepositoryMapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at

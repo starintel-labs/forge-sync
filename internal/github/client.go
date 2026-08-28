@@ -11,13 +11,20 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/starintel-labs/forge-sync/internal/api"
 	"github.com/starintel-labs/forge-sync/internal/model"
 )
 
-const maxResponseBody = 32 << 20
+const (
+	maxResponseBody = 32 << 20
+	// defaultThrottleMaxWait bounds a single proactive rate-limit wait.
+	defaultThrottleMaxWait = 15 * time.Minute
+	// defaultThrottleLowMark starts waiting once fewer responses remain.
+	defaultThrottleLowMark = 10
+)
 
 type Client struct {
 	baseURL    string
@@ -25,23 +32,45 @@ type Client struct {
 	token      string
 	http       *http.Client
 	Retry      api.RetryPolicy
+
+	limitsMu        sync.Mutex
+	limitsRemaining int64
+	limitsResetAt   time.Time
+	throttleMaxWait time.Duration
+	throttleLowMark int64
+	throttleNow     func() time.Time
+	throttleSleep   func(context.Context, time.Duration) error
 }
 
 type APIError struct {
-	Method     string
-	URL        string
-	StatusCode int
-	RequestID  string
-	RetryAfter time.Duration
+	Method      string
+	URL         string
+	StatusCode  int
+	RequestID   string
+	RetryAfter  time.Duration
+	rateLimited bool
+	Body        string
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("github API %s %s returned %d (request %s)", e.Method, e.URL, e.StatusCode, e.RequestID)
+	detail := e.Body
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	return fmt.Sprintf("github API %s %s returned %d (request %s): %s", e.Method, e.URL, e.StatusCode, e.RequestID, detail)
 }
 
 // Transient reports whether the request may succeed when retried.
 func (e *APIError) Transient() bool {
+	if e.rateLimited {
+		return true
+	}
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// RateLimited reports whether the failure came from an exhausted rate limit.
+func (e *APIError) RateLimited() bool {
+	return e.rateLimited
 }
 
 // RetryDelay returns the server-provided retry delay, if any.
@@ -56,6 +85,18 @@ func WithRetry(policy api.RetryPolicy) Option {
 	return func(c *Client) { c.Retry = policy }
 }
 
+// WithThrottle overrides the proactive rate-limit wait bound and low mark.
+func WithThrottle(maxWait time.Duration, lowRemaining int64) Option {
+	return func(c *Client) {
+		if maxWait > 0 {
+			c.throttleMaxWait = maxWait
+		}
+		if lowRemaining > 0 {
+			c.throttleLowMark = lowRemaining
+		}
+	}
+}
+
 func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
 	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -67,7 +108,12 @@ func New(baseURL, token string, timeout time.Duration, options ...Option) (*Clie
 	if timeout <= 0 {
 		return nil, errors.New("GitHub timeout must be positive")
 	}
-	client := &Client{baseURL: parsed.String(), uploadBase: uploadsBase(parsed), token: token, http: &http.Client{Timeout: timeout}, Retry: api.DefaultRetryPolicy()}
+	client := &Client{
+		baseURL: parsed.String(), uploadBase: uploadsBase(parsed), token: token,
+		http: &http.Client{Timeout: timeout}, Retry: api.DefaultRetryPolicy(),
+		throttleMaxWait: defaultThrottleMaxWait, throttleLowMark: defaultThrottleLowMark,
+		throttleNow: time.Now, throttleSleep: api.Sleep,
+	}
 	for _, option := range options {
 		option(client)
 	}
@@ -187,6 +233,14 @@ func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]mo
 	return result, nil
 }
 
+// ErrPullRequestExists reports GitHub's refusal to create a pull request
+// because one already exists for the same head and base refs.
+var ErrPullRequestExists = errors.New("pull request already exists for head and base")
+
+// ErrNoCommits reports GitHub's refusal to create a pull request for refs
+// that cannot span one here (no difference, invalid or missing head).
+var ErrNoCommits = errors.New("pull request refs cannot span a difference")
+
 func (c *Client) CreatePullRequest(ctx context.Context, owner, name string, source model.PullRequest) (model.PullRequest, error) {
 	payload, err := pullRequestPayload(source, true)
 	if err != nil {
@@ -194,10 +248,42 @@ func (c *Client) CreatePullRequest(ctx context.Context, owner, name string, sour
 	}
 	var created pullRequest
 	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls"
-	if err := c.writeJSON(ctx, http.MethodPost, endpoint, payload, &created); err != nil {
+	err = c.writeJSON(ctx, http.MethodPost, endpoint, payload, &created)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity {
+		if strings.Contains(apiErr.Body, "A pull request already exists for") {
+			return model.PullRequest{}, ErrPullRequestExists
+		}
+		// "No commits between", invalid head ref, and similar validation
+		// refusals share one sentinel: the pair cannot exist on GitHub.
+		return model.PullRequest{}, ErrNoCommits
+	}
+	if err != nil {
 		return model.PullRequest{}, err
 	}
 	return created.model(), nil
+}
+
+// ErrCannotReopen reports GitHub's refusal to reopen a pull request (for
+// example when its head ref was deleted). The reconciler must converge the
+// Forgejo side to GitHub's closed state instead.
+var ErrCannotReopen = errors.New("pull request cannot be reopened")
+
+func (c *Client) FindPullRequestByHead(ctx context.Context, owner, name, headRef string) (model.PullRequest, bool, error) {
+	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls?state=all&head=" + url.QueryEscape(owner+":"+headRef)
+	response, err := c.attempt(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return model.PullRequest{}, false, err
+	}
+	defer response.Body.Close()
+	var batch []pullRequest
+	if err := decode(response.Body, &batch); err != nil {
+		return model.PullRequest{}, false, fmt.Errorf("decode GitHub pull requests by head: %w", err)
+	}
+	if len(batch) == 0 {
+		return model.PullRequest{}, false, nil
+	}
+	return batch[0].model(), true, nil
 }
 
 func (c *Client) UpdatePullRequest(ctx context.Context, owner, name string, number int64, source model.PullRequest) (model.PullRequest, error) {
@@ -207,7 +293,12 @@ func (c *Client) UpdatePullRequest(ctx context.Context, owner, name string, numb
 	}
 	var updated pullRequest
 	endpoint := c.baseURL + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls/" + strconv.FormatInt(number, 10)
-	if err := c.writeJSON(ctx, http.MethodPatch, endpoint, payload, &updated); err != nil {
+	err = c.writeJSON(ctx, http.MethodPatch, endpoint, payload, &updated)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnprocessableEntity && strings.Contains(apiErr.Body, "cannot be reopened") {
+		return model.PullRequest{}, fmt.Errorf("pull request %d: %w", number, ErrCannotReopen)
+	}
+	if err != nil {
 		return model.PullRequest{}, err
 	}
 	return updated.model(), nil
@@ -342,6 +433,10 @@ func (c *Client) issuePayload(ctx context.Context, owner, name string, source mo
 	labels, err := c.ensureLabels(ctx, owner, name, source.Labels)
 	if err != nil {
 		return nil, err
+	}
+	if labels == nil {
+		// GitHub rejects a null labels value; absent labels are [].
+		labels = []string{}
 	}
 	payload := map[string]any{
 		"title":  source.Title,
@@ -644,6 +739,9 @@ func (c *Client) getAll(ctx context.Context, path string, destination *[]reposit
 }
 
 func (c *Client) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	if err := c.obeyRateLimit(ctx); err != nil {
+		return nil, err
+	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return nil, err
@@ -658,15 +756,79 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 	if err != nil {
 		return nil, err
 	}
+	c.recordRateLimit(response.Header)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
 		response.Body.Close()
-		return nil, &APIError{
+		apiErr := &APIError{
 			Method: method, URL: endpoint, StatusCode: response.StatusCode,
-			RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfter: retryAfter(response.Header),
+			RequestID: response.Header.Get("X-GitHub-Request-Id"), Body: string(body),
 		}
+		// GitHub reports exhausted limits as 403 or 429 with rate headers;
+		// ordinary 403s are permission failures and stay permanent.
+		if response.StatusCode == http.StatusTooManyRequests || (response.StatusCode == http.StatusForbidden && c.rateLimited(response.Header)) {
+			apiErr.rateLimited = true
+			apiErr.RetryAfter = c.rateWaitFromHeaders(response.Header)
+		} else {
+			apiErr.RetryAfter = retryAfter(response.Header)
+		}
+		return nil, apiErr
 	}
 	return response, nil
+}
+
+// obeyRateLimit blocks before a request when the last observed budget is
+// nearly exhausted, waiting for the documented reset time (bounded by
+// throttleMaxWait). Rate limits are obeyed, not hammered.
+func (c *Client) obeyRateLimit(ctx context.Context) error {
+	c.limitsMu.Lock()
+	remaining, resetAt := c.limitsRemaining, c.limitsResetAt
+	lowMark, maxWait := c.throttleLowMark, c.throttleMaxWait
+	now := c.throttleNow()
+	c.limitsMu.Unlock()
+	if remaining <= 0 || remaining >= lowMark {
+		return nil
+	}
+	wait := resetAt.Sub(now)
+	if wait <= 0 || maxWait <= 0 {
+		return nil
+	}
+	if wait > maxWait {
+		wait = maxWait
+	}
+	return c.throttleSleep(ctx, wait)
+}
+
+func (c *Client) recordRateLimit(header http.Header) {
+	remaining, remainingErr := strconv.ParseInt(header.Get("X-RateLimit-Remaining"), 10, 64)
+	reset, resetErr := strconv.ParseInt(header.Get("X-RateLimit-Reset"), 10, 64)
+	if remainingErr != nil || resetErr != nil {
+		return
+	}
+	c.limitsMu.Lock()
+	c.limitsRemaining, c.limitsResetAt = remaining, time.Unix(reset, 0)
+	c.limitsMu.Unlock()
+}
+
+func (c *Client) rateLimited(header http.Header) bool {
+	remaining, err := strconv.ParseInt(header.Get("X-RateLimit-Remaining"), 10, 64)
+	if err == nil && remaining == 0 {
+		return true
+	}
+	return header.Get("Retry-After") != ""
+}
+
+func (c *Client) rateWaitFromHeaders(header http.Header) time.Duration {
+	if seconds, err := strconv.Atoi(header.Get("Retry-After")); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if reset, err := strconv.ParseInt(header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+		if wait := time.Unix(reset, 0).Sub(c.throttleNow()); wait > 0 {
+			return wait
+		}
+	}
+	return time.Minute
 }
 
 // attempt performs a single HTTP request with bounded retry on transient

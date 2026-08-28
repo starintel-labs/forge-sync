@@ -21,6 +21,15 @@ func (f *fakePullRequests) ListPullRequests(context.Context, string, string) ([]
 	return append([]model.PullRequest(nil), f.items...), nil
 }
 
+func (f *fakePullRequests) FindPullRequestByHead(_ context.Context, _, _, head string) (model.PullRequest, bool, error) {
+	for _, item := range f.items {
+		if item.Head == head {
+			return item, true, nil
+		}
+	}
+	return model.PullRequest{}, false, nil
+}
+
 func (f *fakePullRequests) CreatePullRequest(_ context.Context, _, _ string, item model.PullRequest) (model.PullRequest, error) {
 	f.created = append(f.created, item)
 	item.ID = 1000 + int64(len(f.created))

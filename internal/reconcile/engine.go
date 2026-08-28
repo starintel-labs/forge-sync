@@ -230,12 +230,29 @@ func (e *Engine) ProcessWebhook(ctx context.Context, _ string, _ string, payload
 		_, err := e.Reconcile(ctx, "all", false)
 		return err
 	}
-	owner, _, ok := strings.Cut(envelope.Repository.FullName, "/")
-	if !ok || !contains(e.namespaces, owner) {
+	owner, name, ok := strings.Cut(envelope.Repository.FullName, "/")
+	if !ok || name == "" {
+		return errors.New("webhook repository full name is malformed")
+	}
+	if contains(e.namespaces, owner) {
+		_, err := e.Reconcile(ctx, envelope.Repository.FullName, false)
+		return err
+	}
+	// Forgejo-side payloads carry the mapped owner, not the GitHub namespace:
+	// resolve through the durable mapping table instead.
+	matches, err := e.store.RepositoriesByForgejoPath(ctx, owner, name)
+	if err != nil {
+		return err
+	}
+	if len(matches) == 0 {
 		return fmt.Errorf("webhook repository %q is outside configured namespaces", envelope.Repository.FullName)
 	}
-	_, err := e.Reconcile(ctx, envelope.Repository.FullName, false)
-	return err
+	for _, match := range matches {
+		if _, err := e.Reconcile(ctx, match.GitHubFullName, false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func contains(values []string, wanted string) bool {

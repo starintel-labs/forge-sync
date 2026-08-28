@@ -147,6 +147,27 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 	}
 	_ = pairedForgejo
 
+	// Gitea migrations preserve GitHub numbering but may rewrite bodies
+	// (attribution footers), defeating hash pairing. Pair the remainder by
+	// matching index and title; the Forgejo state is recorded as the
+	// baseline so the next cycle copies the canonical GitHub content over
+	// any migration footer.
+	indexGitHub, indexForgejo := indexTitlePairs(unconsumed(githubIssues, consumedGitHub), unconsumed(forgejoIssues, consumedForgejo))
+	for githubID, forgejoID := range indexGitHub {
+		githubIssue := githubByID[githubID]
+		forgejoIssue := forgejoByID[forgejoID]
+		consumedGitHub[githubID] = true
+		consumedForgejo[forgejoID] = true
+		if !dryRun {
+			mapping := issueMapping(repository.GitHubID, githubIssue, forgejoIssue)
+			mapping.LastStateHash = Hash(forgejoIssue)
+			if err := r.store.UpsertIssueMapping(ctx, mapping); err != nil {
+				return err
+			}
+		}
+	}
+	_ = indexForgejo
+
 	for _, githubIssue := range unconsumed(githubIssues, consumedGitHub) {
 		if dryRun {
 			continue
@@ -257,6 +278,32 @@ func uniqueHashPairs(githubIssues, forgejoIssues []model.Issue) (map[int64]int64
 			githubPairs[githubIDs[0]] = forgejoIDs[0]
 			forgejoPairs[forgejoIDs[0]] = githubIDs[0]
 		}
+	}
+	return githubPairs, forgejoPairs
+}
+
+// indexTitlePairs pairs leftovers whose issue index and title match exactly.
+// Gitea's GitHub migrator preserves numbering and titles while rewriting
+// bodies, so this recovers migrated pairs the hash pass cannot see. A number
+// used on either side more than once is skipped.
+func indexTitlePairs(githubIssues, forgejoIssues []model.Issue) (map[int64]int64, map[int64]int64) {
+	githubByIndex := map[int64][]model.Issue{}
+	forgejoByIndex := map[int64][]model.Issue{}
+	for _, issue := range githubIssues {
+		githubByIndex[issue.Index] = append(githubByIndex[issue.Index], issue)
+	}
+	for _, issue := range forgejoIssues {
+		forgejoByIndex[issue.Index] = append(forgejoByIndex[issue.Index], issue)
+	}
+	githubPairs := map[int64]int64{}
+	forgejoPairs := map[int64]int64{}
+	for index, githubMatches := range githubByIndex {
+		forgejoMatches := forgejoByIndex[index]
+		if len(githubMatches) != 1 || len(forgejoMatches) != 1 || githubMatches[0].Title != forgejoMatches[0].Title {
+			continue
+		}
+		githubPairs[githubMatches[0].ID] = forgejoMatches[0].ID
+		forgejoPairs[forgejoMatches[0].ID] = githubMatches[0].ID
 	}
 	return githubPairs, forgejoPairs
 }

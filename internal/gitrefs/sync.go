@@ -63,10 +63,10 @@ func (s *Synchronizer) Sync(ctx context.Context, repository string, github, forg
 	if _, err := run(ctx, workspace, Remote{}, "init", "--bare", gitDir); err != nil {
 		return Result{}, fmt.Errorf("initialize temporary repository: %w", err)
 	}
-	if err := fetch(ctx, gitDir, GitHub, github); err != nil {
+	if err := fetchWithRetry(ctx, gitDir, GitHub, github); err != nil {
 		return Result{}, err
 	}
-	if err := fetch(ctx, gitDir, Forgejo, forgejo); err != nil {
+	if err := fetchWithRetry(ctx, gitDir, Forgejo, forgejo); err != nil {
 		return Result{}, err
 	}
 	githubRefs, err := localRefs(ctx, gitDir, GitHub)
@@ -133,6 +133,46 @@ func (r Remote) validate() error {
 		}
 	}
 	return nil
+}
+
+// fetchWithRetry retries transient gateway and network failures (for example
+// a reverse proxy returning 502 while the forge restarts) with bounded
+// exponential backoff. Authentication and repository-not-found failures fail
+// immediately.
+func fetchWithRetry(ctx context.Context, gitDir string, forge Forge, remote Remote) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(time.Duration(attempt) * 5 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		lastErr = fetch(ctx, gitDir, forge, remote)
+		if lastErr == nil {
+			return nil
+		}
+		if !transientGitFailure(lastErr) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func transientGitFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	for _, marker := range []string{"error: 502", "error: 503", "error: 504", "error: 429", "Connection reset by peer", "connection refused", "timed out", "Could not resolve host", "Failed to connect"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func fetch(ctx context.Context, gitDir string, forge Forge, remote Remote) error {

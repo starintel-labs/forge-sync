@@ -18,13 +18,20 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/model"
 )
 
-const maxResponseBody = 32 << 20
+const (
+	maxResponseBody = 32 << 20
+	// defaultMigrateTimeout bounds a single repository migration; migrations
+	// clone the entire source repository and can run for minutes.
+	defaultMigrateTimeout = 30 * time.Minute
+)
 
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
-	Retry   api.RetryPolicy
+	baseURL        string
+	token          string
+	http           *http.Client
+	migrationHTTP  *http.Client
+	migrateTimeout time.Duration
+	Retry          api.RetryPolicy
 }
 
 type APIError struct {
@@ -56,7 +63,11 @@ func WithRetry(policy api.RetryPolicy) Option {
 }
 
 func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
-	parsed, err := url.Parse(strings.TrimRight(baseURL, "/"))
+	trimmed := strings.TrimRight(baseURL, "/")
+	// Tolerate values that already include the API suffix so credentials and
+	// URLs copied from other tooling do not double it.
+	trimmed = strings.TrimSuffix(trimmed, "/api/v1")
+	parsed, err := url.Parse(trimmed)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid Forgejo API URL %q", baseURL)
 	}
@@ -66,7 +77,13 @@ func New(baseURL, token string, timeout time.Duration, options ...Option) (*Clie
 	if timeout <= 0 {
 		return nil, errors.New("Forgejo timeout must be positive")
 	}
-	client := &Client{baseURL: parsed.String(), token: token, http: &http.Client{Timeout: timeout}, Retry: api.DefaultRetryPolicy()}
+	client := &Client{
+		baseURL: parsed.String(), token: token,
+		http:           &http.Client{Timeout: timeout},
+		migrationHTTP:  &http.Client{},
+		migrateTimeout: defaultMigrateTimeout,
+		Retry:          api.DefaultRetryPolicy(),
+	}
 	for _, option := range options {
 		option(client)
 	}
@@ -97,10 +114,17 @@ func (c *Client) ListRepositories(ctx context.Context, namespace string) ([]mode
 func (c *Client) ListIssues(ctx context.Context, owner, name string) ([]model.Issue, error) {
 	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/issues?state=all&type=issues&limit=50"
 	var result []model.Issue
+	var previousFirst int64
 	for page := 1; page <= 1000; page++ {
 		var batch []issue
 		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch); err != nil {
 			return nil, err
+		}
+		if len(batch) > 0 && batch[0].ID == previousFirst {
+			return result, nil
+		}
+		if len(batch) > 0 {
+			previousFirst = batch[0].ID
 		}
 		for _, item := range batch {
 			if item.PullRequest != nil {
@@ -152,10 +176,26 @@ func (c *Client) UpdateIssue(ctx context.Context, owner, name string, index int6
 func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]model.PullRequest, error) {
 	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls?state=all&limit=50"
 	var result []model.PullRequest
+	var previousFirst int64
 	for page := 1; page <= 1000; page++ {
 		var batch []pullRequest
-		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch); err != nil {
+		status, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch)
+		if err != nil {
+			var apiErr *APIError
+			// Gitea returns 404 for the pulls endpoint of an empty
+			// repository (no git data yet): that is an empty list, not a
+			// missing repository.
+			if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound && page == 1 {
+				return nil, nil
+			}
 			return nil, err
+		}
+		_ = status
+		if len(batch) > 0 && batch[0].ID == previousFirst {
+			return result, nil
+		}
+		if len(batch) > 0 {
+			previousFirst = batch[0].ID
 		}
 		for _, item := range batch {
 			result = append(result, item.model())
@@ -165,6 +205,20 @@ func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]mo
 		}
 	}
 	return nil, errors.New("Forgejo pull request pagination exceeded 1000 pages")
+}
+
+func (c *Client) FindPullRequestByHead(ctx context.Context, owner, name, headRef string) (model.PullRequest, bool, error) {
+	// Gitea has no head filter on the list endpoint; scan the full list.
+	all, err := c.ListPullRequests(ctx, owner, name)
+	if err != nil {
+		return model.PullRequest{}, false, err
+	}
+	for _, item := range all {
+		if item.Head == headRef {
+			return item, true, nil
+		}
+	}
+	return model.PullRequest{}, false, nil
 }
 
 func (c *Client) CreatePullRequest(ctx context.Context, owner, name string, source model.PullRequest) (model.PullRequest, error) {
@@ -194,14 +248,16 @@ func (c *Client) UpdatePullRequest(ctx context.Context, owner, name string, inde
 }
 
 type pullRequest struct {
-	ID        int64     `json:"id"`
-	Index     int64     `json:"index"`
-	Title     string    `json:"title"`
-	Body      string    `json:"body"`
-	State     string    `json:"state"`
-	Merged    bool      `json:"merged"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Head      struct {
+	ID     int64 `json:"id"`
+	Number int64 `json:"number"`
+	// Older Gitea versions expose the PR number as "index".
+	LegacyIndex int64     `json:"index"`
+	Title       string    `json:"title"`
+	Body        string    `json:"body"`
+	State       string    `json:"state"`
+	Merged      bool      `json:"merged"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	Head        struct {
 		Ref string `json:"ref"`
 	} `json:"head"`
 	Base struct {
@@ -210,8 +266,12 @@ type pullRequest struct {
 }
 
 func (p pullRequest) model() model.PullRequest {
+	index := p.Number
+	if index <= 0 {
+		index = p.LegacyIndex
+	}
 	return model.PullRequest{
-		ID: p.ID, Index: p.Index, Title: p.Title, Body: p.Body, State: p.State,
+		ID: p.ID, Index: index, Title: p.Title, Body: p.Body, State: p.State,
 		Head: p.Head.Ref, Base: p.Base.Ref, Merged: p.Merged, UpdatedAt: p.UpdatedAt,
 	}
 }
@@ -236,10 +296,19 @@ func pullRequestPayload(source model.PullRequest, create bool) (map[string]any, 
 func (c *Client) ListComments(ctx context.Context, owner, name string, issueIndex int64) ([]model.Comment, error) {
 	root := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/issues/" + fmt.Sprint(issueIndex) + "/comments"
 	var result []model.Comment
+	var previousFirst int64
 	for page := 1; page <= 1000; page++ {
 		var batch []comment
 		if _, err := c.doJSON(ctx, http.MethodGet, root+"?limit=50&page="+fmt.Sprint(page), nil, &batch); err != nil {
 			return nil, err
+		}
+		// Some Gitea versions clamp out-of-range pages to the last page;
+		// a repeated first ID means pagination is exhausted.
+		if len(batch) > 0 && batch[0].ID == previousFirst {
+			return result, nil
+		}
+		if len(batch) > 0 {
+			previousFirst = batch[0].ID
 		}
 		for _, item := range batch {
 			result = append(result, item.model(issueIndex))
@@ -383,12 +452,21 @@ func (c *Client) ensureMilestone(ctx context.Context, owner, name, title string)
 }
 
 func (c *Client) ListReleases(ctx context.Context, owner, name string) ([]model.Release, error) {
-	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases?limit=50&draft=true&pre-release=true"
+	// No draft/pre-release filters: Gitea treats those query params as
+	// inclusion filters and would hide ordinary releases.
+	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/releases?limit=50"
 	var result []model.Release
+	var previousFirst int64
 	for page := 1; page <= 1000; page++ {
 		var batch []release
 		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+fmt.Sprint(page), nil, &batch); err != nil {
 			return nil, err
+		}
+		if len(batch) > 0 && batch[0].ID == previousFirst {
+			return result, nil
+		}
+		if len(batch) > 0 {
+			previousFirst = batch[0].ID
 		}
 		for _, item := range batch {
 			result = append(result, item.model())
@@ -524,6 +602,7 @@ func releasePayload(source model.Release) map[string]any {
 
 func (c *Client) listRepositories(ctx context.Context, path string) ([]repository, int, error) {
 	var result []repository
+	var previousFirst int64
 	for page := 1; page <= 1000; page++ {
 		separator := "&"
 		if !strings.Contains(path, "?") {
@@ -537,6 +616,12 @@ func (c *Client) listRepositories(ctx context.Context, path string) ([]repositor
 		status, err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &batch)
 		if err != nil {
 			return nil, status, err
+		}
+		if len(batch) > 0 && batch[0].ID == previousFirst {
+			return result, status, nil
+		}
+		if len(batch) > 0 {
+			previousFirst = batch[0].ID
 		}
 		result = append(result, batch...)
 		if len(batch) < 50 {
@@ -566,11 +651,32 @@ func (c *Client) MigrateRepository(ctx context.Context, source model.Repository,
 		"releases":      true,
 		"wiki":          true,
 	}
+	migrateCtx, cancel := context.WithTimeout(ctx, c.migrateTimeout)
+	defer cancel()
+	migratePolicy := c.Retry
+	// Migration retries are safe: conflicts adopt the existing repository.
+	migratePolicy.NetworkRetry = true
 	var created repository
-	if _, err := c.doJSON(ctx, http.MethodPost, c.baseURL+"/api/v1/repos/migrate", payload, &created); err != nil {
+	if _, err := c.doJSONWithPolicy(migrateCtx, c.migrationHTTP, migratePolicy, http.MethodPost, c.baseURL+"/api/v1/repos/migrate", payload, &created); err != nil {
+		// A gateway timeout can sever the response after the repository was
+		// created; a retried POST then conflicts. Adopt the existing
+		// repository so migration stays idempotent.
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict {
+			return c.adoptMigrated(migrateCtx, source.Owner, source.Name)
+		}
 		return model.Repository{}, fmt.Errorf("migrate %s: %w", source.FullName, err)
 	}
 	return created.model(), nil
+}
+
+func (c *Client) adoptMigrated(ctx context.Context, owner, name string) (model.Repository, error) {
+	var existing repository
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name)
+	if _, err := c.doJSONWith(ctx, c.http, http.MethodGet, endpoint, nil, &existing); err != nil {
+		return model.Repository{}, fmt.Errorf("adopt migrated repository %s/%s: %w", owner, name, err)
+	}
+	return existing.model(), nil
 }
 
 func (c *Client) UpdateRepositoryIdentity(ctx context.Context, oldOwner, oldName, newOwner, newName string) error {
@@ -643,8 +749,16 @@ func (r repository) model() model.Repository {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpoint string, requestBody, responseBody any) (int, error) {
+	return c.doJSONWith(ctx, c.http, method, endpoint, requestBody, responseBody)
+}
+
+func (c *Client) doJSONWith(ctx context.Context, client *http.Client, method, endpoint string, requestBody, responseBody any) (int, error) {
+	return c.doJSONWithPolicy(ctx, client, c.Retry, method, endpoint, requestBody, responseBody)
+}
+
+func (c *Client) doJSONWithPolicy(ctx context.Context, client *http.Client, policy api.RetryPolicy, method, endpoint string, requestBody, responseBody any) (int, error) {
 	var status int
-	err := c.Retry.Do(ctx, func() error {
+	err := policy.Do(ctx, func() error {
 		var body io.Reader
 		if requestBody != nil {
 			encoded, err := json.Marshal(requestBody)
@@ -662,11 +776,12 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, requestBod
 		if requestBody != nil {
 			request.Header.Set("Content-Type", "application/json")
 		}
-		response, err := c.http.Do(request)
+		response, err := client.Do(request)
 		if err != nil {
 			return err
 		}
 		defer response.Body.Close()
+		status = response.StatusCode
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBody))
 			return &APIError{Method: method, URL: endpoint, StatusCode: response.StatusCode, RetryAfter: retryAfter(response.Header)}
@@ -676,7 +791,6 @@ func (c *Client) doJSON(ctx context.Context, method, endpoint string, requestBod
 				return fmt.Errorf("decode Forgejo response: %w", err)
 			}
 		}
-		status = response.StatusCode
 		return nil
 	})
 	return status, err

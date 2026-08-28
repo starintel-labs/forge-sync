@@ -32,6 +32,7 @@ type Config struct {
 	MaxConcurrency       int
 	MaxWebhookBody       int64
 	APIRetry             api.RetryPolicy
+	ForgejoOwnerMap      map[string]string
 }
 
 func FromEnvironment() (Config, error) {
@@ -56,6 +57,7 @@ func FromEnvironment() (Config, error) {
 			MaxDelay:    durationOr("FORGE_SYNC_API_RETRY_MAX", 30*time.Second),
 			Sleep:       api.Sleep,
 		},
+		ForgejoOwnerMap: ownerMapOr("FORGE_SYNC_FORGEJO_OWNER_MAP"),
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -102,7 +104,40 @@ func (c Config) Validate() error {
 	if err := c.APIRetry.Validate(); err != nil {
 		return fmt.Errorf("API retry policy: %w", err)
 	}
+	for namespace, owner := range c.ForgejoOwnerMap {
+		if !contains(c.Namespaces, namespace) {
+			return fmt.Errorf("owner map key %q is outside the configured namespaces", namespace)
+		}
+		if owner == "" || strings.ContainsAny(owner, "/ \t") {
+			return fmt.Errorf("owner map target for %q is invalid", namespace)
+		}
+	}
 	return nil
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func ownerMapOr(key string) map[string]string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil
+	}
+	result := map[string]string{}
+	for _, pair := range strings.Split(value, ",") {
+		namespace, owner, ok := strings.Cut(pair, ":")
+		if !ok {
+			continue
+		}
+		result[strings.TrimSpace(namespace)] = strings.TrimSpace(owner)
+	}
+	return result
 }
 
 func valueOr(key, fallback string) string {
