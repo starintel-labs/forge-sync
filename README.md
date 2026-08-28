@@ -67,11 +67,15 @@ All configuration is environment-only. Secrets must be injected at runtime
 | `FORGE_SYNC_MAX_WEBHOOK_BODY` | `1048576` | Webhook body cap (1 KiB–16 MiB) |
 | `FORGE_SYNC_API_MAX_ATTEMPTS` | `4` | Bounded attempts per API call (incl. first) |
 | `FORGE_SYNC_API_RETRY_BASE` | `1s` | Exponential backoff base delay |
-| `FORGE_SYNC_API_RETRY_MAX` | `30s` | Backoff ceiling; also caps server `Retry-After` |
+| `FORGE_SYNC_API_RETRY_MAX` | `30s` | Backoff ceiling; also caps server `Retry-After` for ordinary transients |
+| `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(unset)* | Comma list of `github-namespace:forgejo-owner` redirects, e.g. `starintel-labs:nsaspy`; keys must be configured namespaces |
 
 Transient API failures (HTTP `429`, `5xx`, network errors) are retried with a
 deterministic exponential backoff that honors a longer server-provided
-`Retry-After` when present. `4xx` failures other than `429` fail immediately.
+`Retry-After` when present. Exhausted rate limits (429, or 403 with exhausted
+rate headers) are obeyed rather than hammered: the client waits out the
+documented reset time (capped by a dedicated rate-limit ceiling of 15 minutes)
+before the next request. Other `4xx` failures fail immediately.
 
 ## Usage
 
