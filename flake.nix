@@ -7,7 +7,13 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    let
+      nixosModule = { lib, pkgs, ... }: {
+        imports = [ ./nix/module.nix ];
+        services.forge-sync.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
+    in
+    (flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
         forge-sync = pkgs.buildGo124Module {
@@ -50,5 +56,10 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [ go_1_24 gopls gotools git ];
         };
-      });
+      })) // {
+      nixosModules = {
+        default = nixosModule;
+        forge-sync = nixosModule;
+      };
+    };
 }
