@@ -3,6 +3,13 @@
 let
   cfg = config.services.forge-sync;
   inherit (lib) mkEnableOption mkIf mkOption types;
+
+  secretEnvironmentNames = [
+    "FORGE_SYNC_GITHUB_TOKEN"
+    "FORGE_SYNC_FORGEJO_TOKEN"
+    "FORGE_SYNC_GITHUB_WEBHOOK_SECRET"
+    "FORGE_SYNC_FORGEJO_WEBHOOK_SECRET"
+  ];
 in
 {
   options.services.forge-sync = {
@@ -32,9 +39,9 @@ in
         FORGE_SYNC_NAMESPACES = "starintel-labs,lost-rob0t";
       };
       description = ''
-        Non-secret environment variables passed to forge-sync. Do not put API
-        tokens or webhook secrets here because Nix option values may be copied
-        into the Nix store; use environmentFile for secrets instead.
+        Non-secret environment variables passed to forge-sync. Secret token and
+        webhook variables are rejected here because Nix option values may be
+        copied into the Nix store; use environmentFile for secrets instead.
       '';
     };
 
@@ -66,6 +73,10 @@ in
       {
         assertion = !(lib.hasPrefix "/nix/store/" cfg.environmentFile);
         message = "services.forge-sync.environmentFile must not point into the Nix store.";
+      }
+      {
+        assertion = lib.all (name: !(builtins.hasAttr name cfg.environment)) secretEnvironmentNames;
+        message = "forge-sync secrets must be supplied through services.forge-sync.environmentFile, not services.forge-sync.environment.";
       }
     ];
 
