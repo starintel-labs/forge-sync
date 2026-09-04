@@ -221,7 +221,21 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 	}
 	gitResult, err := e.git.Sync(ctx, mapping.GitHubFullName, githubRemote, forgejoRemote, dryRun)
 	if err != nil {
-		return RepositoryResult{}, fmt.Errorf("synchronize refs for %s: %w", mapping.GitHubFullName, err)
+		if dryRun {
+			return RepositoryResult{}, fmt.Errorf("synchronize refs for %s: %w", mapping.GitHubFullName, err)
+		}
+		// A single repository whose mirror refuses a ref update (for
+		// example a GitHub branch rule blocking force-pushes) must not
+		// abort the whole cycle: record it durably, keep reconciling the
+		// remaining objects, and let operators surface it via conflicts.
+		if err := e.store.AddConflict(ctx, model.Conflict{
+			Kind: "git-ref-error", Repository: mapping.GitHubFullName,
+			ObjectKey:   "git-refs", GitHubState: "sync-failed", ForgejoState: "sync-failed",
+			LastKnownState: err.Error(), CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			return RepositoryResult{}, fmt.Errorf("record git-ref failure for %s: %w", mapping.GitHubFullName, err)
+		}
+		return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, nil
 	}
 	if err := e.issues.Reconcile(ctx, mapping, dryRun); err != nil {
 		return RepositoryResult{}, fmt.Errorf("synchronize issues for %s: %w", mapping.GitHubFullName, err)
