@@ -35,6 +35,7 @@ type Config struct {
 	MaxConcurrency       int
 	MaxWebhookBody       int64
 	MaxRefSizeKB         int64
+	MaxAssetSizeBytes    int64
 	APIRetry             api.RetryPolicy
 	ForgejoOwnerMap      map[string]string
 	ActionSecrets        []model.ActionSecret
@@ -63,6 +64,7 @@ func FromEnvironment() (Config, error) {
 		MaxConcurrency:       intOr("FORGE_SYNC_MAX_CONCURRENCY", 4),
 		MaxWebhookBody:       int64Or("FORGE_SYNC_MAX_WEBHOOK_BODY", 1<<20),
 		MaxRefSizeKB:         int64Or("FORGE_SYNC_MAX_REF_SIZE_MB", 8<<10) << 10,
+		MaxAssetSizeBytes:    int64Or("FORGE_SYNC_MAX_ASSET_SIZE_MB", 512) << 20,
 		APIRetry: api.RetryPolicy{
 			MaxAttempts: intOr("FORGE_SYNC_API_MAX_ATTEMPTS", 4),
 			BaseDelay:   durationOr("FORGE_SYNC_API_RETRY_BASE", time.Second),

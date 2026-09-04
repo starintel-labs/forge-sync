@@ -122,6 +122,36 @@ func TestAssetsAreEnsuredOnBothSidesWithoutDeletion(t *testing.T) {
 	}
 }
 
+func TestOversizedAssetIsSkippedAndRecorded(t *testing.T) {
+	t.Parallel()
+	store, repository := releaseState(t)
+	githubItem := model.Release{ID: 31, Tag: "v1.0.0", Name: "v1.0.0", Assets: []model.ReleaseAsset{
+		{ID: 91, Name: "small.tgz", Size: 128}, {ID: 92, Name: "huge.iso", Size: 2 << 30},
+	}}
+	forgejoItem := model.Release{ID: 22, Tag: "v1.0.0", Name: "v1.0.0"}
+	github := &fakeReleases{items: []model.Release{githubItem}}
+	forgejo := &fakeReleases{items: []model.Release{forgejoItem}}
+
+	limit := int64(512 << 20)
+	reconciler := releases.New(github, forgejo, store, releases.WithMaxAssetSize(limit))
+	if err := reconciler.Reconcile(context.Background(), repository, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(github.downloaded) != 1 || github.downloaded[0] != 91 {
+		t.Fatalf("downloads=%v, want only the small asset", github.downloaded)
+	}
+	if len(forgejo.uploaded) != 1 || forgejo.uploaded[0] != "small.tgz" {
+		t.Fatalf("forgejo uploads=%v", forgejo.uploaded)
+	}
+	conflicts, err := store.ListConflicts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Kind != "release-asset-skipped" || conflicts[0].ObjectKey != "v1.0.0/huge.iso" {
+		t.Fatalf("conflicts=%#v", conflicts)
+	}
+}
+
 func TestMissingReleaseSideRecordsConflictWithoutDeletion(t *testing.T) {
 	t.Parallel()
 	store, repository := releaseState(t)

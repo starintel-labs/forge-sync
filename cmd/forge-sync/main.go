@@ -140,7 +140,7 @@ func openRuntime(cfg config.Config) (*application, error) {
 	issueReconciler := issues.New(githubClient, forgejoClient, store)
 	commentReconciler := comments.New(githubClient, forgejoClient, store)
 	pullRequestReconciler := pullrequests.New(githubClient, forgejoClient, store)
-	releaseReconciler := releases.New(githubClient, forgejoClient, store)
+	releaseReconciler := releases.New(githubClient, forgejoClient, store, releases.WithMaxAssetSize(cfg.MaxAssetSizeBytes))
 	actionSecretReconciler := secrets.New(forgejoClient, cfg.ActionSecrets)
 	gitSynchronizer := gitrefs.NewSynchronizer(store, cfg.GitTimeout)
 	engine := reconcile.New(

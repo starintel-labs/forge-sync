@@ -83,6 +83,7 @@ All configuration is environment-only. Secrets must be injected at runtime
 | `FORGE_SYNC_GITHUB_MIN_INTERVAL` | `0` (off) | Minimum spacing between GitHub API requests to protect quota (e.g. `1500ms`) |
 | `FORGE_SYNC_FORGEJO_MIN_INTERVAL` | `0` (off) | Minimum spacing between Gitea API requests |
 | `FORGE_SYNC_MAX_REF_SIZE_MB` | `8192` | Ref sync skips repositories whose GitHub size exceeds this (recorded as `ref-sync-skipped`; never deleted) |
+| `FORGE_SYNC_MAX_ASSET_SIZE_MB` | `512` | Release assets larger than this are skipped and recorded as `release-asset-skipped` instead of being buffered into memory |
 | `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(identity)* | Comma list of `github-namespace:forgejo-owner` redirects, e.g. `lost-rob0t:nsaspy`; unset keys keep their GitHub namespace |
 | `FORGE_SYNC_ACTION_SECRET_MAP` | *(unset)* | Comma list of `github-owner/repository:SECRET_NAME=RUNTIME_ENV_VAR` mappings for Forgejo Actions secrets |
 

@@ -24,16 +24,31 @@ type Forge interface {
 }
 
 type Reconciler struct {
-	github  Forge
-	forgejo Forge
-	store   *state.Store
+	github       Forge
+	forgejo      Forge
+	store        *state.Store
+	maxAssetSize int64
 }
 
-func New(github, forgejo Forge, store *state.Store) *Reconciler {
+// Option customizes the release reconciler.
+type Option func(*Reconciler)
+
+// WithMaxAssetSize bounds asset synchronization: assets larger than the
+// limit are recorded as skipped instead of being buffered into memory.
+// Zero or negative disables the bound.
+func WithMaxAssetSize(limit int64) Option {
+	return func(r *Reconciler) { r.maxAssetSize = limit }
+}
+
+func New(github, forgejo Forge, store *state.Store, options ...Option) *Reconciler {
 	if github == nil || forgejo == nil || store == nil {
 		panic("release reconciler requires both forges and state")
 	}
-	return &Reconciler{github: github, forgejo: forgejo, store: store}
+	reconciler := &Reconciler{github: github, forgejo: forgejo, store: store}
+	for _, option := range options {
+		option(reconciler)
+	}
+	return reconciler
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryMapping, dryRun bool) error {
@@ -235,6 +250,9 @@ func (r *Reconciler) reconcileAssets(ctx context.Context, githubOwner, githubNam
 		if forgejoAssets[asset.Name] {
 			continue
 		}
+		if r.exceedsAssetLimit(ctx, repository, githubRelease.Tag, asset, "github", "forgejo") {
+			continue
+		}
 		content, err := r.github.DownloadReleaseAsset(ctx, githubOwner, githubName, githubRelease.ID, asset.ID)
 		if err != nil {
 			return fmt.Errorf("download GitHub asset %q: %w", asset.Name, err)
@@ -247,6 +265,9 @@ func (r *Reconciler) reconcileAssets(ctx context.Context, githubOwner, githubNam
 		if githubAssets[asset.Name] {
 			continue
 		}
+		if r.exceedsAssetLimit(ctx, repository, forgejoRelease.Tag, asset, "forgejo", "github") {
+			continue
+		}
 		content, err := r.forgejo.DownloadReleaseAsset(ctx, repository.ForgejoOwner, repository.ForgejoName, forgejoRelease.ID, asset.ID)
 		if err != nil {
 			return fmt.Errorf("download Forgejo asset %q: %w", asset.Name, err)
@@ -256,6 +277,26 @@ func (r *Reconciler) reconcileAssets(ctx context.Context, githubOwner, githubNam
 		}
 	}
 	return nil
+}
+
+// exceedsAssetLimit records a durable conflict for an asset too large to
+// buffer and reports whether it must be skipped. Oversized assets are never
+// downloaded, so a multi-gigabyte release artifact cannot stall or abort a
+// reconciliation cycle.
+func (r *Reconciler) exceedsAssetLimit(ctx context.Context, repository model.RepositoryMapping, tag string, asset model.ReleaseAsset, from, to string) bool {
+	if r.maxAssetSize <= 0 || asset.Size <= r.maxAssetSize {
+		return false
+	}
+	if err := r.store.AddConflict(ctx, model.Conflict{
+		Kind: "release-asset-skipped", Repository: repository.GitHubFullName,
+		ObjectKey:      tag + "/" + asset.Name,
+		GitHubState:    fmt.Sprintf("%s %d bytes", from, asset.Size),
+		ForgejoState:   fmt.Sprintf("limit %d bytes", r.maxAssetSize),
+		LastKnownState: to + "-copy-skipped", CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		return false
+	}
+	return true
 }
 
 func Hash(release model.Release) string {

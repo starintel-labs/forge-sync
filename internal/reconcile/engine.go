@@ -258,7 +258,19 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		return RepositoryResult{}, fmt.Errorf("synchronize pull request comments for %s: %w", mapping.GitHubFullName, err)
 	}
 	if err := e.releases.Reconcile(ctx, mapping, dryRun); err != nil {
-		return RepositoryResult{}, fmt.Errorf("synchronize releases for %s: %w", mapping.GitHubFullName, err)
+		if dryRun {
+			return RepositoryResult{}, fmt.Errorf("synchronize releases for %s: %w", mapping.GitHubFullName, err)
+		}
+		// A release failure (for example an asset download timing out)
+		// must not abort the cycle: record it durably and continue.
+		if err := e.store.AddConflict(ctx, model.Conflict{
+			Kind: "release-error", Repository: mapping.GitHubFullName,
+			ObjectKey: "releases", GitHubState: "sync-failed", ForgejoState: "sync-failed",
+			LastKnownState: err.Error(), CreatedAt: time.Now().UTC(),
+		}); err != nil {
+			return RepositoryResult{}, fmt.Errorf("record release failure for %s: %w", mapping.GitHubFullName, err)
+		}
+		return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, nil
 	}
 	return RepositoryResult{Repository: mapping.GitHubFullName, Actions: gitResult.Actions, Conflicts: len(gitResult.Conflicts)}, nil
 }
