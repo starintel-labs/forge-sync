@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/starintel-labs/forge-sync/internal/api"
+	"github.com/starintel-labs/forge-sync/internal/model"
 )
 
 const (
@@ -36,9 +37,14 @@ type Config struct {
 	MaxRefSizeKB         int64
 	APIRetry             api.RetryPolicy
 	ForgejoOwnerMap      map[string]string
+	ActionSecrets        []model.ActionSecret
 }
 
 func FromEnvironment() (Config, error) {
+	actionSecrets, err := actionSecretsOr("FORGE_SYNC_ACTION_SECRET_MAP")
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		GitHubAPI:            valueOr("FORGE_SYNC_GITHUB_API", defaultGitHubAPI),
 		GitHubToken:          os.Getenv("FORGE_SYNC_GITHUB_TOKEN"),
@@ -64,6 +70,7 @@ func FromEnvironment() (Config, error) {
 			Sleep:       api.Sleep,
 		},
 		ForgejoOwnerMap: ownerMapOr("FORGE_SYNC_FORGEJO_OWNER_MAP"),
+		ActionSecrets:   actionSecrets,
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -121,6 +128,27 @@ func (c Config) Validate() error {
 			return fmt.Errorf("owner map target for %q is invalid", namespace)
 		}
 	}
+	seenSecrets := map[string]bool{}
+	for _, secret := range c.ActionSecrets {
+		owner, name, ok := strings.Cut(secret.Repository, "/")
+		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+			return fmt.Errorf("action secret repository %q is invalid", secret.Repository)
+		}
+		if !contains(c.Namespaces, owner) {
+			return fmt.Errorf("action secret repository %q is outside the configured namespaces", secret.Repository)
+		}
+		if !validIdentifier(secret.Name) {
+			return fmt.Errorf("action secret name %q is invalid", secret.Name)
+		}
+		if secret.Value == "" {
+			return fmt.Errorf("action secret %s:%s has an empty runtime value", secret.Repository, secret.Name)
+		}
+		key := secret.Repository + ":" + secret.Name
+		if seenSecrets[key] {
+			return fmt.Errorf("action secret %s is configured more than once", key)
+		}
+		seenSecrets[key] = true
+	}
 	return nil
 }
 
@@ -147,6 +175,48 @@ func ownerMapOr(key string) map[string]string {
 		result[strings.TrimSpace(namespace)] = strings.TrimSpace(owner)
 	}
 	return result
+}
+
+func actionSecretsOr(key string) ([]model.ActionSecret, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil, nil
+	}
+	var result []model.ActionSecret
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		binding, environment, ok := strings.Cut(item, "=")
+		if !ok || strings.Contains(environment, "=") {
+			return nil, fmt.Errorf("action secret mapping %q must be repository:secret=environment", item)
+		}
+		repository, name, ok := strings.Cut(strings.TrimSpace(binding), ":")
+		if !ok || strings.Contains(name, ":") {
+			return nil, fmt.Errorf("action secret mapping %q must be repository:secret=environment", item)
+		}
+		repository, name, environment = strings.TrimSpace(repository), strings.TrimSpace(name), strings.TrimSpace(environment)
+		if !validIdentifier(environment) {
+			return nil, fmt.Errorf("action secret mapping %q references an invalid environment variable", item)
+		}
+		value, present := os.LookupEnv(environment)
+		if !present || value == "" {
+			return nil, fmt.Errorf("action secret source environment variable %q is empty", environment)
+		}
+		result = append(result, model.ActionSecret{Repository: repository, Name: name, Value: value})
+	}
+	return result, nil
+}
+
+func validIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || character == '_' || (index > 0 && character >= '0' && character <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func valueOr(key, fallback string) string {

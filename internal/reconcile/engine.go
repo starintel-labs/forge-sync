@@ -17,6 +17,7 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/pullrequests"
 	"github.com/starintel-labs/forge-sync/internal/releases"
 	"github.com/starintel-labs/forge-sync/internal/repository"
+	"github.com/starintel-labs/forge-sync/internal/secrets"
 	"github.com/starintel-labs/forge-sync/internal/state"
 )
 
@@ -37,6 +38,7 @@ type Engine struct {
 	comments         *comments.Reconciler
 	pullRequests     *pullrequests.Reconciler
 	releases         *releases.Reconciler
+	actionSecrets    *secrets.Reconciler
 	git              *gitrefs.Synchronizer
 	store            *state.Store
 	namespaces       []string
@@ -48,8 +50,8 @@ type Engine struct {
 	locks            sync.Map
 }
 
-func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, pullRequestReconciler *pullrequests.Reconciler, releaseReconciler *releases.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int, maxRefSizeKB int64) *Engine {
-	if repositories == nil || issueReconciler == nil || commentReconciler == nil || pullRequestReconciler == nil || releaseReconciler == nil || git == nil || store == nil || len(namespaces) == 0 || githubToken == "" || forgejoToken == "" || maxConcurrency < 1 {
+func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, pullRequestReconciler *pullrequests.Reconciler, releaseReconciler *releases.Reconciler, actionSecretReconciler *secrets.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int, maxRefSizeKB int64) *Engine {
+	if repositories == nil || issueReconciler == nil || commentReconciler == nil || pullRequestReconciler == nil || releaseReconciler == nil || actionSecretReconciler == nil || git == nil || store == nil || len(namespaces) == 0 || githubToken == "" || forgejoToken == "" || maxConcurrency < 1 {
 		panic("reconciliation engine configuration is incomplete")
 	}
 	if maxRefSizeKB <= 0 {
@@ -58,7 +60,8 @@ func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler
 	return &Engine{
 		repositories: repositories, issues: issueReconciler, comments: commentReconciler,
 		pullRequests: pullRequestReconciler, releases: releaseReconciler,
-		git: git, store: store,
+		actionSecrets: actionSecretReconciler,
+		git:           git, store: store,
 		namespaces: append([]string(nil), namespaces...), githubToken: githubToken, forgejoToken: forgejoToken,
 		forgejoCloneBase: strings.TrimSuffix(strings.TrimRight(forgejoAPI, "/"), "/api/v1"), maxConcurrency: maxConcurrency,
 		maxRefSizeKB: maxRefSizeKB,
@@ -190,6 +193,9 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 	lock := lockValue.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := e.actionSecrets.Reconcile(ctx, mapping, dryRun); err != nil {
+		return RepositoryResult{}, fmt.Errorf("synchronize Actions secrets for %s: %w", mapping.GitHubFullName, err)
+	}
 	if mapping.SizeKB > e.maxRefSizeKB {
 		// A repository whose history exceeds the bounded workspace is
 		// excluded from ref synchronization (never deleted): issues, PRs,

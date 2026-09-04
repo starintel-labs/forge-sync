@@ -78,6 +78,34 @@ func TestMigrateUnknownVisibilityIsPrivate(t *testing.T) {
 	}
 }
 
+func TestSetActionSecretUsesForgejoActionsEndpoint(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/api/v1/repos/nsaspy/example/actions/secrets/API_KEY" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "token forgejo-token" {
+			t.Fatalf("authorization header = %q", r.Header.Get("Authorization"))
+		}
+		var payload map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["name"] != "API_KEY" || payload["data"] != "existing-key" {
+			t.Fatalf("payload=%#v", payload)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	client, err := forgejo.New(server.URL, "forgejo-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetActionSecret(context.Background(), "nsaspy", "example", "API_KEY", "existing-key"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestListPullRequestsPaginatesAndMapsRefs(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

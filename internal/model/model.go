@@ -35,6 +35,12 @@ type RepositoryMapping struct {
 	UpdatedAt      time.Time
 }
 
+type ActionSecret struct {
+	Repository string
+	Name       string
+	Value      string
+}
+
 type Issue struct {
 	ID        int64
 	Index     int64

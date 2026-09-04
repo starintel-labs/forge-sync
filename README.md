@@ -32,6 +32,9 @@ anywhere in its dependency graph.
   on one side are ensured on the other by name. Assets are never deleted, and
   a mapped release that disappears from one side records a conflict instead of
   being deleted or recreated.
+- **Actions secrets**: explicitly configured runtime secret values are written
+  to the mapped Forgejo repository without being persisted or logged. Secret
+  values are never deleted automatically.
 - **Webhooks**: verified HMAC-SHA256 webhooks from both forges trigger scoped
   reconciliation; delivery IDs are claimed in SQLite so replays are suppressed.
 - **Periodic reconciliation** runs on a timer regardless of webhook delivery,
@@ -71,8 +74,21 @@ All configuration is environment-only. Secrets must be injected at runtime
 | `FORGE_SYNC_GITHUB_MIN_INTERVAL` | `0` (off) | Minimum spacing between GitHub API requests to protect quota (e.g. `1500ms`) |
 | `FORGE_SYNC_FORGEJO_MIN_INTERVAL` | `0` (off) | Minimum spacing between Gitea API requests |
 | `FORGE_SYNC_MAX_REF_SIZE_MB` | `8192` | Ref sync skips repositories whose GitHub size exceeds this (recorded as `ref-sync-skipped`; never deleted) |
-| `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(identity)* | `namespace:owner` pairs redirecting GitHub namespaces to Gitea owners (e.g. `lost-rob0t:nsaspy`) |
-| `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(unset)* | Comma list of `github-namespace:forgejo-owner` redirects, e.g. `starintel-labs:nsaspy`; keys must be configured namespaces |
+| `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(identity)* | Comma list of `github-namespace:forgejo-owner` redirects, e.g. `lost-rob0t:nsaspy`; unset keys keep their GitHub namespace |
+| `FORGE_SYNC_ACTION_SECRET_MAP` | *(unset)* | Comma list of `github-owner/repository:SECRET_NAME=RUNTIME_ENV_VAR` mappings for Forgejo Actions secrets |
+
+GitHub's Actions API exposes secret names but not their plaintext values. To
+reuse an existing GitHub key without creating another one, inject that same
+value into the forge-sync runtime and map it explicitly:
+
+```text
+FORGE_SYNC_ACTION_SECRET_MAP=lost-rob0t/prolog-rlm:API_KEY=PROLOG_RLM_API_KEY
+PROLOG_RLM_API_KEY=<the existing API key value>
+```
+
+The source variable is read at startup, held only in memory, and sent over the
+authenticated Forgejo API. It is not written to SQLite, logs, or repository
+files. Removing a mapping does not delete the Forgejo secret.
 
 Transient API failures (HTTP `429`, `5xx`, network errors) are retried with a
 deterministic exponential backoff that honors a longer server-provided

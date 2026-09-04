@@ -24,6 +24,7 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/reconcile"
 	"github.com/starintel-labs/forge-sync/internal/releases"
 	"github.com/starintel-labs/forge-sync/internal/repository"
+	"github.com/starintel-labs/forge-sync/internal/secrets"
 	"github.com/starintel-labs/forge-sync/internal/state"
 	"github.com/starintel-labs/forge-sync/internal/webhooks"
 )
@@ -140,9 +141,10 @@ func openRuntime(cfg config.Config) (*application, error) {
 	commentReconciler := comments.New(githubClient, forgejoClient, store)
 	pullRequestReconciler := pullrequests.New(githubClient, forgejoClient, store)
 	releaseReconciler := releases.New(githubClient, forgejoClient, store)
+	actionSecretReconciler := secrets.New(forgejoClient, cfg.ActionSecrets)
 	gitSynchronizer := gitrefs.NewSynchronizer(store, cfg.GitTimeout)
 	engine := reconcile.New(
-		repositories, issueReconciler, commentReconciler, pullRequestReconciler, releaseReconciler, gitSynchronizer, store,
+		repositories, issueReconciler, commentReconciler, pullRequestReconciler, releaseReconciler, actionSecretReconciler, gitSynchronizer, store,
 		cfg.Namespaces, cfg.GitHubToken, cfg.ForgejoToken, cfg.ForgejoAPI, cfg.MaxConcurrency, cfg.MaxRefSizeKB,
 	)
 	return &application{store: store, engine: engine}, nil

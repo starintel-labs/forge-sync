@@ -20,7 +20,8 @@ func scrubEnv(t *testing.T) {
 		"FORGE_SYNC_GIT_TIMEOUT", "FORGE_SYNC_MAX_CONCURRENCY",
 		"FORGE_SYNC_MAX_WEBHOOK_BODY", "FORGE_SYNC_API_MAX_ATTEMPTS",
 		"FORGE_SYNC_API_RETRY_BASE", "FORGE_SYNC_API_RETRY_MAX",
-		"FORGE_SYNC_FORGEJO_OWNER_MAP",
+		"FORGE_SYNC_FORGEJO_OWNER_MAP", "FORGE_SYNC_ACTION_SECRET_MAP",
+		"PROLOG_RLM_API_KEY",
 	} {
 		t.Setenv(key, "")
 	}
@@ -127,4 +128,55 @@ func TestOwnerMapParsesAndValidates(t *testing.T) {
 			t.Fatal("malformed owner accepted")
 		}
 	})
+}
+
+func TestActionSecretMapReadsRuntimeValue(t *testing.T) {
+	scrubEnv(t)
+	t.Setenv("FORGE_SYNC_GITHUB_TOKEN", "gh")
+	t.Setenv("FORGE_SYNC_FORGEJO_API", "https://forge.example.org")
+	t.Setenv("FORGE_SYNC_FORGEJO_TOKEN", "fj")
+	t.Setenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET", "ghs")
+	t.Setenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET", "fjs")
+	t.Setenv("FORGE_SYNC_ACTION_SECRET_MAP", "lost-rob0t/prolog-rlm:API_KEY=PROLOG_RLM_API_KEY")
+	t.Setenv("PROLOG_RLM_API_KEY", "existing-key")
+
+	cfg, err := config.FromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ActionSecrets) != 1 {
+		t.Fatalf("action secrets=%#v", cfg.ActionSecrets)
+	}
+	secret := cfg.ActionSecrets[0]
+	if secret.Repository != "lost-rob0t/prolog-rlm" || secret.Name != "API_KEY" || secret.Value != "existing-key" {
+		t.Fatalf("action secret=%#v", secret)
+	}
+}
+
+func TestActionSecretMapRejectsMissingRuntimeValue(t *testing.T) {
+	scrubEnv(t)
+	t.Setenv("FORGE_SYNC_GITHUB_TOKEN", "gh")
+	t.Setenv("FORGE_SYNC_FORGEJO_API", "https://forge.example.org")
+	t.Setenv("FORGE_SYNC_FORGEJO_TOKEN", "fj")
+	t.Setenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET", "ghs")
+	t.Setenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET", "fjs")
+	t.Setenv("FORGE_SYNC_ACTION_SECRET_MAP", "lost-rob0t/prolog-rlm:API_KEY=PROLOG_RLM_API_KEY")
+
+	if _, err := config.FromEnvironment(); err == nil {
+		t.Fatal("missing action secret source accepted")
+	}
+}
+
+func TestActionSecretMapRejectsMalformedMapping(t *testing.T) {
+	scrubEnv(t)
+	t.Setenv("FORGE_SYNC_GITHUB_TOKEN", "gh")
+	t.Setenv("FORGE_SYNC_FORGEJO_API", "https://forge.example.org")
+	t.Setenv("FORGE_SYNC_FORGEJO_TOKEN", "fj")
+	t.Setenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET", "ghs")
+	t.Setenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET", "fjs")
+	t.Setenv("FORGE_SYNC_ACTION_SECRET_MAP", "lost-rob0t/prolog-rlm:API_KEY")
+
+	if _, err := config.FromEnvironment(); err == nil {
+		t.Fatal("malformed action secret mapping accepted")
+	}
 }

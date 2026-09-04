@@ -202,6 +202,18 @@ func (c *Client) UpdateIssue(ctx context.Context, owner, name string, index int6
 	return updated.model(), nil
 }
 
+func (c *Client) SetActionSecret(ctx context.Context, owner, name, secretName, value string) error {
+	if owner == "" || name == "" || secretName == "" || value == "" {
+		return errors.New("action secret identity or value is empty")
+	}
+	endpoint := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/actions/secrets/" + url.PathEscape(secretName)
+	payload := map[string]string{"name": secretName, "data": value}
+	if _, err := c.doJSON(ctx, http.MethodPut, endpoint, payload, nil); err != nil {
+		return fmt.Errorf("set Forgejo action secret %q: %w", secretName, err)
+	}
+	return nil
+}
+
 func (c *Client) ListPullRequests(ctx context.Context, owner, name string) ([]model.PullRequest, error) {
 	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/pulls?state=all&limit=50"
 	var result []model.PullRequest
