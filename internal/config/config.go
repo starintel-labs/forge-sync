@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,6 +25,8 @@ type Config struct {
 	ForgejoToken         string
 	GitHubWebhookSecret  string
 	ForgejoWebhookSecret string
+	GitHubWebhookURL     string
+	ForgejoWebhookURL    string
 	Namespaces           []string
 	StatePath            string
 	ListenAddr           string
@@ -46,6 +49,7 @@ func FromEnvironment() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	listenAddr := valueOr("FORGE_SYNC_LISTEN_ADDR", defaultListenAddr)
 	cfg := Config{
 		GitHubAPI:            valueOr("FORGE_SYNC_GITHUB_API", defaultGitHubAPI),
 		GitHubToken:          os.Getenv("FORGE_SYNC_GITHUB_TOKEN"),
@@ -53,9 +57,11 @@ func FromEnvironment() (Config, error) {
 		ForgejoToken:         os.Getenv("FORGE_SYNC_FORGEJO_TOKEN"),
 		GitHubWebhookSecret:  os.Getenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET"),
 		ForgejoWebhookSecret: os.Getenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET"),
+		GitHubWebhookURL:     os.Getenv("FORGE_SYNC_GITHUB_WEBHOOK_URL"),
+		ForgejoWebhookURL:    valueOr("FORGE_SYNC_FORGEJO_WEBHOOK_URL", "http://"+listenAddr+"/webhooks/forgejo"),
 		Namespaces:           splitList(valueOr("FORGE_SYNC_NAMESPACES", "starintel-labs,lost-rob0t")),
 		StatePath:            valueOr("FORGE_SYNC_STATE_PATH", "/var/lib/forge-sync/forge-sync.db"),
-		ListenAddr:           valueOr("FORGE_SYNC_LISTEN_ADDR", defaultListenAddr),
+		ListenAddr:           listenAddr,
 		ReconcileInterval:    durationOr("FORGE_SYNC_RECONCILE_INTERVAL", 5*time.Minute),
 		RequestTimeout:       durationOr("FORGE_SYNC_REQUEST_TIMEOUT", 30*time.Second),
 		GitTimeout:           durationOr("FORGE_SYNC_GIT_TIMEOUT", 5*time.Minute),
@@ -118,6 +124,18 @@ func (c Config) Validate() error {
 	}
 	if c.GitHubMinInterval < 0 || c.ForgejoMinInterval < 0 {
 		return errors.New("request intervals must not be negative")
+	}
+	for name, hookURL := range map[string]string{
+		"FORGE_SYNC_GITHUB_WEBHOOK_URL":  c.GitHubWebhookURL,
+		"FORGE_SYNC_FORGEJO_WEBHOOK_URL": c.ForgejoWebhookURL,
+	} {
+		if hookURL == "" {
+			continue
+		}
+		parsed, err := url.Parse(hookURL)
+		if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" {
+			return fmt.Errorf("%s must be an absolute http(s) URL", name)
+		}
 	}
 	if err := c.APIRetry.Validate(); err != nil {
 		return fmt.Errorf("API retry policy: %w", err)

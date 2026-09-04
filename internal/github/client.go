@@ -16,6 +16,7 @@ import (
 
 	"github.com/starintel-labs/forge-sync/internal/api"
 	"github.com/starintel-labs/forge-sync/internal/model"
+	"github.com/starintel-labs/forge-sync/internal/webhooks"
 )
 
 const (
@@ -922,4 +923,115 @@ func retryAfter(header http.Header) time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 	return 0
+}
+
+type webhookConfig struct {
+	URL         string `json:"url"`
+	ContentType string `json:"content_type"`
+	Secret      string `json:"secret,omitempty"`
+}
+
+type githubWebhook struct {
+	ID     int64         `json:"id"`
+	Active bool          `json:"active"`
+	Events []string      `json:"events"`
+	Config webhookConfig `json:"config"`
+}
+
+func (w githubWebhook) model() webhooks.Hook {
+	return webhooks.Hook{ID: w.ID, URL: w.Config.URL, Events: append([]string(nil), w.Events...), Active: w.Active}
+}
+
+// listWebhooks pages through a GitHub webhook listing. It returns the raw
+// HTTP status so callers can distinguish a missing org (404) from an empty
+// hook list (200).
+func (c *Client) listWebhooks(ctx context.Context, path string) ([]webhooks.Hook, int, error) {
+	var hooks []webhooks.Hook
+	next := c.baseURL + path
+	for page := 0; next != ""; page++ {
+		if page >= 1000 {
+			return nil, 0, errors.New("GitHub webhook pagination exceeded 1000 pages")
+		}
+		response, err := c.attempt(ctx, http.MethodGet, next, nil)
+		if err != nil {
+			var apiErr *APIError
+			if errors.As(err, &apiErr) {
+				return nil, apiErr.StatusCode, err
+			}
+			return nil, 0, err
+		}
+		var batch []githubWebhook
+		if err := decode(response.Body, &batch); err != nil {
+			response.Body.Close()
+			return nil, response.StatusCode, fmt.Errorf("decode GitHub webhooks: %w", err)
+		}
+		response.Body.Close()
+		for _, hook := range batch {
+			hooks = append(hooks, hook.model())
+		}
+		next = nextLink(response.Header.Get("Link"))
+	}
+	return hooks, http.StatusOK, nil
+}
+
+// ListOrgWebhooks returns the org's webhooks; found is false when the
+// namespace is not an organization (HTTP 404).
+func (c *Client) ListOrgWebhooks(ctx context.Context, org string) ([]webhooks.Hook, bool, error) {
+	hooks, status, err := c.listWebhooks(ctx, "/orgs/"+url.PathEscape(org)+"/hooks")
+	if err != nil {
+		return nil, false, err
+	}
+	return hooks, status != http.StatusNotFound, nil
+}
+
+func (c *Client) CreateOrgWebhook(ctx context.Context, org string, hook webhooks.Hook, secret string) error {
+	return c.writeJSON(ctx, http.MethodPost, "/orgs/"+url.PathEscape(org)+"/hooks", githubWebhookCreate(hook, secret), nil)
+}
+
+func (c *Client) UpdateOrgWebhook(ctx context.Context, org string, id int64, hook webhooks.Hook, secret string) error {
+	return c.writeJSON(ctx, http.MethodPatch, fmt.Sprintf("/orgs/%s/hooks/%d", url.PathEscape(org), id), githubWebhookUpdate(hook, secret), nil)
+}
+
+func (c *Client) ListRepoWebhooks(ctx context.Context, owner, name string) ([]webhooks.Hook, error) {
+	path := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/hooks"
+	hooks, status, err := c.listWebhooks(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusNotFound {
+		return nil, fmt.Errorf("list GitHub webhooks for %s/%s: repository not found", owner, name)
+	}
+	return hooks, nil
+}
+
+func (c *Client) CreateRepoWebhook(ctx context.Context, owner, name string, hook webhooks.Hook, secret string) error {
+	endpoint := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/hooks"
+	return c.writeJSON(ctx, http.MethodPost, endpoint, githubWebhookCreate(hook, secret), nil)
+}
+
+func (c *Client) UpdateRepoWebhook(ctx context.Context, owner, name string, id int64, hook webhooks.Hook, secret string) error {
+	endpoint := fmt.Sprintf("/repos/%s/%s/hooks/%d", url.PathEscape(owner), url.PathEscape(name), id)
+	return c.writeJSON(ctx, http.MethodPatch, endpoint, githubWebhookUpdate(hook, secret), nil)
+}
+
+type githubWebhookCreatePayload struct {
+	Name   string        `json:"name"`
+	Active bool          `json:"active"`
+	Events []string      `json:"events"`
+	Config webhookConfig `json:"config"`
+}
+
+type githubWebhookUpdatePayload struct {
+	Active bool          `json:"active"`
+	Events []string      `json:"events"`
+	Config webhookConfig `json:"config"`
+}
+
+func githubWebhookCreate(hook webhooks.Hook, secret string) githubWebhookCreatePayload {
+	return githubWebhookCreatePayload{Name: "web", Active: hook.Active, Events: hook.Events,
+		Config: webhookConfig{URL: hook.URL, ContentType: "json", Secret: secret}}
+}
+
+func githubWebhookUpdate(hook webhooks.Hook, secret string) githubWebhookUpdatePayload {
+	return githubWebhookUpdatePayload{Active: hook.Active, Events: hook.Events, Config: webhookConfig{URL: hook.URL, ContentType: "json", Secret: secret}}
 }

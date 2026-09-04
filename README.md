@@ -42,6 +42,12 @@ anywhere in its dependency graph.
   values are never deleted automatically.
 - **Webhooks**: verified HMAC-SHA256 webhooks from both forges trigger scoped
   reconciliation; delivery IDs are claimed in SQLite so replays are suppressed.
+  `forge-sync wire-webhooks [--dry-run]` provisions them idempotently: an org
+  webhook per org namespace, per-repository webhooks for user namespaces,
+  events matching the receiver allow-list, and the configured secret. Hooks at
+  other URLs are never touched; drift (events, active state) is repaired in
+  place. Because neither API returns the stored secret, rotating
+  `FORGE_SYNC_*_WEBHOOK_SECRET` requires deleting the existing hook first.
 - **Periodic reconciliation** runs on a timer regardless of webhook delivery,
   providing self-healing and continuous discovery.
 
@@ -69,6 +75,8 @@ All configuration is environment-only. Secrets must be injected at runtime
 | `FORGE_SYNC_FORGEJO_TOKEN` | *(required)* | Forgejo token with repo, issue, PR, release scopes |
 | `FORGE_SYNC_GITHUB_WEBHOOK_SECRET` | *(required)* | HMAC secret for GitHub webhooks |
 | `FORGE_SYNC_FORGEJO_WEBHOOK_SECRET` | *(required)* | HMAC secret for Forgejo webhooks |
+| `FORGE_SYNC_GITHUB_WEBHOOK_URL` | *(unset)* | Public receiver URL for GitHub webhooks (e.g. `https://forge.example.org/webhooks/github`); unset skips GitHub wiring |
+| `FORGE_SYNC_FORGEJO_WEBHOOK_URL` | `http://<listen>/webhooks/forgejo` | Receiver URL Forgejo delivers to (loopback by default) |
 | `FORGE_SYNC_NAMESPACES` | `starintel-labs,lost-rob0t` | Allowed namespaces (restricted to this set) |
 | `FORGE_SYNC_STATE_PATH` | `/var/lib/forge-sync/forge-sync.db` | SQLite state file |
 | `FORGE_SYNC_LISTEN_ADDR` | `127.0.0.1:8080` | Health/metrics/webhook listener |
@@ -110,7 +118,7 @@ before the next request. Other `4xx` failures fail immediately.
 ## Usage
 
 ```text
-forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|serve}
+forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|wire-webhooks [--dry-run]|serve}
 ```
 
 - `bootstrap --dry-run` — inventory both forges and report drift without any
