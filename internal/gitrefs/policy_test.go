@@ -7,7 +7,7 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/gitrefs"
 )
 
-func TestCanonicalBranchFastForwardsGitHubToForgejo(t *testing.T) {
+func TestGitHubAheadBranchFastForwardsIntoForgejo(t *testing.T) {
 	t.Parallel()
 	ancestry := graph(map[string][]string{"B": {"A"}})
 	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/heads/main": "B"}, map[string]string{"refs/heads/main": "A"}, ancestry)
@@ -17,57 +17,117 @@ func TestCanonicalBranchFastForwardsGitHubToForgejo(t *testing.T) {
 	if len(conflicts) != 0 || len(actions) != 1 {
 		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
 	}
-	if actions[0].From != gitrefs.GitHub || actions[0].To != gitrefs.Forgejo || actions[0].SHA != "B" {
+	if actions[0].From != gitrefs.GitHub || actions[0].To != gitrefs.Forgejo || actions[0].SHA != "B" || actions[0].Force {
 		t.Fatalf("wrong action: %#v", actions[0])
 	}
 }
 
-func TestCanonicalBranchDivergenceConflictsWithoutPush(t *testing.T) {
+func TestForgejoAheadBranchFastForwardsGitHub(t *testing.T) {
+	t.Parallel()
+	ancestry := graph(map[string][]string{"B": {"A"}})
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/heads/main": "A"}, map[string]string{"refs/heads/main": "B"}, ancestry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 0 || len(actions) != 1 {
+		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
+	}
+	if actions[0].From != gitrefs.Forgejo || actions[0].To != gitrefs.GitHub || actions[0].SHA != "B" || actions[0].Force {
+		t.Fatalf("wrong action: %#v", actions[0])
+	}
+}
+
+func TestDivergenceEnforcesForgejoMaster(t *testing.T) {
 	t.Parallel()
 	ancestry := graph(map[string][]string{"B": {"A"}, "C": {"A"}})
 	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/heads/main": "B"}, map[string]string{"refs/heads/main": "C"}, ancestry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(actions) != 0 || len(conflicts) != 1 {
+	if len(actions) != 1 || len(conflicts) != 1 {
 		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
 	}
-	if conflicts[0].GitHubState != "B" || conflicts[0].ForgejoState != "C" {
-		t.Fatalf("conflict lacks both SHAs: %#v", conflicts[0])
+	if actions[0].From != gitrefs.Forgejo || actions[0].To != gitrefs.GitHub || actions[0].SHA != "C" || !actions[0].Force {
+		t.Fatalf("master enforcement action missing: %#v", actions[0])
+	}
+	if conflicts[0].Kind != "git-ref-override" || conflicts[0].GitHubState != "B" || conflicts[0].ForgejoState != "C" {
+		t.Fatalf("override record lacks both SHAs: %#v", conflicts[0])
 	}
 }
 
-func TestForgejoDevelopmentBranchPromotesToGitHub(t *testing.T) {
+func TestForgejoOnlyBranchMirrorsToGitHub(t *testing.T) {
 	t.Parallel()
-	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", nil, map[string]string{"refs/heads/feature/foo": "D"}, graph(nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(conflicts) != 0 || len(actions) != 1 || actions[0].From != gitrefs.Forgejo || actions[0].To != gitrefs.GitHub {
-		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
-	}
-}
-
-func TestForgejoOnlyDevelopmentBranchIsNeverDeleted(t *testing.T) {
-	t.Parallel()
-	actions, _, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/heads/main": "A"}, map[string]string{
-		"refs/heads/main": "A", "refs/heads/fix/local": "D", "refs/heads/personal": "E",
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/heads/main": "A"}, map[string]string{
+		"refs/heads/main": "A", "refs/heads/feature/foo": "D", "refs/heads/personal": "E",
 	}, graph(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(actions) != 1 || actions[0].Ref != "refs/heads/fix/local" {
-		t.Fatalf("unexpected actions: %#v", actions)
+	if len(conflicts) != 0 || len(actions) != 2 {
+		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
+	}
+	for _, action := range actions {
+		if action.From != gitrefs.Forgejo || action.To != gitrefs.GitHub {
+			t.Fatalf("unexpected action: %#v", action)
+		}
 	}
 }
 
-func TestChangedTagAlwaysConflicts(t *testing.T) {
+func TestGitHubOnlyBranchIsPulledIntoForgejo(t *testing.T) {
 	t.Parallel()
-	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/tags/v1": "B"}, map[string]string{"refs/tags/v1": "A"}, graph(map[string][]string{"B": {"A"}}))
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{
+		"refs/heads/main": "A", "refs/heads/agent/x": "F",
+	}, map[string]string{"refs/heads/main": "A"}, graph(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(actions) != 0 || len(conflicts) != 1 {
+	if len(conflicts) != 0 || len(actions) != 1 {
+		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
+	}
+	if actions[0].From != gitrefs.GitHub || actions[0].To != gitrefs.Forgejo || actions[0].Ref != "refs/heads/agent/x" {
+		t.Fatalf("unexpected action: %#v", actions[0])
+	}
+}
+
+func TestFastForwardedTagMirrorsToGitHub(t *testing.T) {
+	t.Parallel()
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/tags/v1": "A"}, map[string]string{"refs/tags/v1": "B"}, graph(map[string][]string{"B": {"A"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 0 || len(actions) != 1 {
+		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
+	}
+	if actions[0].From != gitrefs.Forgejo || actions[0].To != gitrefs.GitHub || actions[0].Force {
+		t.Fatalf("unexpected action: %#v", actions[0])
+	}
+}
+
+func TestDivergedTagEnforcesForgejoMaster(t *testing.T) {
+	t.Parallel()
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", map[string]string{"refs/tags/v1": "B"}, map[string]string{"refs/tags/v1": "C"}, graph(map[string][]string{"B": {"A"}, "C": {"A"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || len(conflicts) != 1 {
+		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
+	}
+	if !actions[0].Force || actions[0].SHA != "C" {
+		t.Fatalf("unexpected action: %#v", actions[0])
+	}
+	if conflicts[0].Kind != "git-ref-override" || conflicts[0].GitHubState != "B" || conflicts[0].ForgejoState != "C" {
+		t.Fatalf("override record lacks both SHAs: %#v", conflicts[0])
+	}
+}
+
+func TestIdenticalRefsAreNoOp(t *testing.T) {
+	t.Parallel()
+	refs := map[string]string{"refs/heads/main": "A", "refs/tags/v1": "T"}
+	actions, conflicts, err := gitrefs.Plan("starintel-labs/example", refs, refs, graph(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 0 || len(conflicts) != 0 {
 		t.Fatalf("actions=%#v conflicts=%#v", actions, conflicts)
 	}
 }

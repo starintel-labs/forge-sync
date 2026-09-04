@@ -13,7 +13,7 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/state"
 )
 
-func TestSynchronizerFastForwardsCanonicalBranch(t *testing.T) {
+func TestSynchronizerFastForwardsBehindForgejo(t *testing.T) {
 	t.Parallel()
 	fixture := newGitFixture(t)
 	fixture.commit(t, "A")
@@ -34,7 +34,7 @@ func TestSynchronizerFastForwardsCanonicalBranch(t *testing.T) {
 	}
 }
 
-func TestSynchronizerRecordsDivergenceWithoutPush(t *testing.T) {
+func TestSynchronizerEnforcesForgejoOnDivergence(t *testing.T) {
 	t.Parallel()
 	fixture := newGitFixture(t)
 	fixture.commit(t, "A")
@@ -46,16 +46,45 @@ func TestSynchronizerRecordsDivergenceWithoutPush(t *testing.T) {
 	fixture.commit(t, "C")
 	fixture.push(t, fixture.forgejo, "main")
 	forgejoBefore := fixture.ref(t, fixture.forgejo, "refs/heads/main")
+	githubBefore := fixture.ref(t, fixture.github, "refs/heads/main")
 
 	result, err := fixture.synchronizer(t).Sync(context.Background(), "starintel-labs/example", gitrefs.Remote{URL: fixture.github}, gitrefs.Remote{URL: fixture.forgejo}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Actions) != 0 || len(result.Conflicts) != 1 {
+	if len(result.Actions) != 1 || len(result.Conflicts) != 1 {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+	if !result.Actions[0].Force || result.Actions[0].To != gitrefs.GitHub {
+		t.Fatalf("unexpected action: %#v", result.Actions[0])
 	}
 	if got := fixture.ref(t, fixture.forgejo, "refs/heads/main"); got != forgejoBefore {
 		t.Fatalf("divergent Forgejo main changed from %s to %s", forgejoBefore, got)
+	}
+	if got := fixture.ref(t, fixture.github, "refs/heads/main"); got != forgejoBefore || got == githubBefore {
+		t.Fatalf("GitHub main = %s, want enforced Forgejo state %s", got, forgejoBefore)
+	}
+}
+
+func TestSynchronizerPullsGitHubOnlyBranchIntoForgejo(t *testing.T) {
+	t.Parallel()
+	fixture := newGitFixture(t)
+	fixture.commit(t, "A")
+	fixture.push(t, fixture.github, "main")
+	fixture.push(t, fixture.forgejo, "main")
+	fixture.run(t, "checkout", "-b", "agent/x")
+	fixture.commit(t, "agent")
+	fixture.push(t, fixture.github, "agent/x")
+
+	result, err := fixture.synchronizer(t).Sync(context.Background(), "starintel-labs/example", gitrefs.Remote{URL: fixture.github}, gitrefs.Remote{URL: fixture.forgejo}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Actions) != 1 || result.Actions[0].To != gitrefs.Forgejo {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+	if got := fixture.ref(t, fixture.forgejo, "refs/heads/agent/x"); got == "" {
+		t.Fatal("agent/x did not appear on Forgejo")
 	}
 }
 

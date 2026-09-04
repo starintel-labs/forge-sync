@@ -14,13 +14,18 @@ anywhere in its dependency graph.
 - **Visibility**: unknown or missing visibility always fails closed to
   *private*. An API failure is never interpreted as deletion or as a
   visibility change.
-- **Refs**:
-  - GitHub is authoritative for `main`, `master`, and `refs/tags/*`
-    (fast-forward only).
-  - Forgejo is authoritative for development branches matching
-    `feature/*`, `fix/*`, `agent/*`, `rage/*` (fast-forward only).
-  - Divergent history is never force-pushed; a conflict is recorded and both
-    sides are left untouched.
+- **Refs** (true two-way sync, Forgejo is the master forge):
+  - Every branch and tag ref on either forge participates; there is no
+    prefix allow-list.
+  - A ref that is behind on one forge fast-forwards from the other, in
+    whichever direction that is (GitHub-only changes are pulled into
+    Forgejo; Forgejo-only changes are pushed to GitHub).
+  - A ref missing on one forge is copied from the other. Refs are never
+    deleted by the policy.
+  - When histories truly diverge, Forgejo (`git.starintel.actor`) wins: its
+    state is force-enforced on the GitHub mirror and the overridden GitHub
+    SHA is recorded as a `git-ref-override` audit entry for recovery.
+    Forgejo history is never overwritten.
 - **Issues, comments, labels, milestones**: bidirectional reconciliation with
   durable stable-ID mappings, content state hashes, conflict recording, and
   loop suppression.
@@ -42,11 +47,15 @@ anywhere in its dependency graph.
 
 ### Conflict resolution
 
-The service never picks a winner. When both sides changed the same object
+Git refs are self-healing: a behind ref fast-forwards in whichever direction
+is needed, and on true divergence the master forge (Forgejo) is enforced on
+the GitHub mirror, with the overridden GitHub SHA recorded as a
+`git-ref-override` entry so it remains recoverable. For every other object
+the service never picks a winner: when both sides changed the same object
 since the last synchronized state, the object's divergent hashes are recorded
-in the `conflicts` table and surfaced by `forge-sync conflicts`, the `/metrics`
-endpoint, and the `inspect` subcommand. Operators resolve manually; the next
-reconciliation then treats the resolved state as canonical.
+in the `conflicts` table and surfaced by `forge-sync conflicts`, the
+`/metrics` endpoint, and the `inspect` subcommand. Operators resolve manually;
+the next reconciliation then treats the resolved state as canonical.
 
 ## Configuration
 

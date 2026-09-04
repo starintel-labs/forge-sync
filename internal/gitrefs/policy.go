@@ -3,7 +3,6 @@ package gitrefs
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/starintel-labs/forge-sync/internal/model"
@@ -17,21 +16,22 @@ const (
 )
 
 type Action struct {
-	Ref  string
-	SHA  string
-	From Forge
-	To   Forge
+	Ref   string
+	SHA   string
+	From  Forge
+	To    Forge
+	Force bool
 }
 
 type Ancestry func(ancestor, descendant string) (bool, error)
 
-var developmentPrefixes = []string{
-	"refs/heads/feature/",
-	"refs/heads/fix/",
-	"refs/heads/agent/",
-	"refs/heads/rage/",
-}
-
+// Plan derives the reconciliation actions for every branch and tag ref that
+// exists on either forge. Sync is two-way: a ref that is behind on one forge
+// fast-forwards from the other, in whichever direction that is. Forgejo is
+// the master forge: when the two sides truly diverge, its state is enforced
+// on the GitHub mirror and the overridden GitHub SHA is recorded for audit.
+// Refs are never deleted; a ref missing on one forge is copied from the
+// other, so history is only ever overwritten on GitHub, never on Forgejo.
 func Plan(repository string, githubRefs, forgejoRefs map[string]string, isAncestor Ancestry) ([]Action, []model.Conflict, error) {
 	if repository == "" || isAncestor == nil {
 		return nil, nil, fmt.Errorf("repository and ancestry checker are required")
@@ -39,86 +39,55 @@ func Plan(repository string, githubRefs, forgejoRefs map[string]string, isAncest
 	var actions []Action
 	var conflicts []model.Conflict
 
-	for _, ref := range sortedKeys(githubRefs) {
-		if !canonical(ref) {
-			continue
-		}
-		sourceSHA := githubRefs[ref]
-		targetSHA, exists := forgejoRefs[ref]
-		if !exists {
-			actions = append(actions, Action{Ref: ref, SHA: sourceSHA, From: GitHub, To: Forgejo})
-			continue
-		}
-		if sourceSHA == targetSHA {
-			continue
-		}
-		if strings.HasPrefix(ref, "refs/tags/") {
-			conflicts = append(conflicts, refConflict(repository, ref, sourceSHA, targetSHA))
-			continue
-		}
-		fastForward, err := isAncestor(targetSHA, sourceSHA)
-		if err != nil {
-			return nil, nil, fmt.Errorf("check ancestry for %s: %w", ref, err)
-		}
-		if fastForward {
-			actions = append(actions, Action{Ref: ref, SHA: sourceSHA, From: GitHub, To: Forgejo})
-		} else {
-			conflicts = append(conflicts, refConflict(repository, ref, sourceSHA, targetSHA))
-		}
-	}
-
-	for _, ref := range sortedKeys(forgejoRefs) {
-		if !development(ref) {
-			continue
-		}
-		sourceSHA := forgejoRefs[ref]
-		targetSHA, exists := githubRefs[ref]
-		if !exists {
-			actions = append(actions, Action{Ref: ref, SHA: sourceSHA, From: Forgejo, To: GitHub})
-			continue
-		}
-		if sourceSHA == targetSHA {
-			continue
-		}
-		fastForward, err := isAncestor(targetSHA, sourceSHA)
-		if err != nil {
-			return nil, nil, fmt.Errorf("check ancestry for %s: %w", ref, err)
-		}
-		if fastForward {
-			actions = append(actions, Action{Ref: ref, SHA: sourceSHA, From: Forgejo, To: GitHub})
-		} else {
-			conflicts = append(conflicts, refConflict(repository, ref, targetSHA, sourceSHA))
+	for _, ref := range union(githubRefs, forgejoRefs) {
+		githubSHA, onGitHub := githubRefs[ref]
+		forgejoSHA, onForgejo := forgejoRefs[ref]
+		switch {
+		case !onForgejo:
+			actions = append(actions, Action{Ref: ref, SHA: githubSHA, From: GitHub, To: Forgejo})
+		case !onGitHub:
+			actions = append(actions, Action{Ref: ref, SHA: forgejoSHA, From: Forgejo, To: GitHub})
+		case githubSHA == forgejoSHA:
+		default:
+			forgejoAhead, err := isAncestor(githubSHA, forgejoSHA)
+			if err != nil {
+				return nil, nil, fmt.Errorf("check ancestry for %s: %w", ref, err)
+			}
+			if forgejoAhead {
+				actions = append(actions, Action{Ref: ref, SHA: forgejoSHA, From: Forgejo, To: GitHub})
+				continue
+			}
+			githubAhead, err := isAncestor(forgejoSHA, githubSHA)
+			if err != nil {
+				return nil, nil, fmt.Errorf("check ancestry for %s: %w", ref, err)
+			}
+			if githubAhead {
+				actions = append(actions, Action{Ref: ref, SHA: githubSHA, From: GitHub, To: Forgejo})
+				continue
+			}
+			actions = append(actions, Action{Ref: ref, SHA: forgejoSHA, From: Forgejo, To: GitHub, Force: true})
+			conflicts = append(conflicts, model.Conflict{
+				Kind: "git-ref-override", Repository: repository, ObjectKey: ref,
+				GitHubState: githubSHA, ForgejoState: forgejoSHA, CreatedAt: time.Now().UTC(),
+			})
 		}
 	}
 
 	return actions, conflicts, nil
 }
 
-func canonical(ref string) bool {
-	return ref == "refs/heads/main" || ref == "refs/heads/master" || strings.HasPrefix(ref, "refs/tags/")
-}
-
-func development(ref string) bool {
-	for _, prefix := range developmentPrefixes {
-		if strings.HasPrefix(ref, prefix) && len(ref) > len(prefix) {
-			return true
-		}
+func union(githubRefs, forgejoRefs map[string]string) []string {
+	set := map[string]bool{}
+	for ref := range githubRefs {
+		set[ref] = true
 	}
-	return false
-}
-
-func sortedKeys(refs map[string]string) []string {
-	keys := make([]string, 0, len(refs))
-	for ref := range refs {
-		keys = append(keys, ref)
+	for ref := range forgejoRefs {
+		set[ref] = true
 	}
-	sort.Strings(keys)
-	return keys
-}
-
-func refConflict(repository, ref, githubSHA, forgejoSHA string) model.Conflict {
-	return model.Conflict{
-		Kind: "git-ref", Repository: repository, ObjectKey: ref,
-		GitHubState: githubSHA, ForgejoState: forgejoSHA, CreatedAt: time.Now().UTC(),
+	refs := make([]string, 0, len(set))
+	for ref := range set {
+		refs = append(refs, ref)
 	}
+	sort.Strings(refs)
+	return refs
 }
