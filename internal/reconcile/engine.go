@@ -44,12 +44,16 @@ type Engine struct {
 	forgejoToken     string
 	forgejoCloneBase string
 	maxConcurrency   int
+	maxRefSizeKB     int64
 	locks            sync.Map
 }
 
-func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, pullRequestReconciler *pullrequests.Reconciler, releaseReconciler *releases.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int) *Engine {
+func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler, commentReconciler *comments.Reconciler, pullRequestReconciler *pullrequests.Reconciler, releaseReconciler *releases.Reconciler, git *gitrefs.Synchronizer, store *state.Store, namespaces []string, githubToken, forgejoToken, forgejoAPI string, maxConcurrency int, maxRefSizeKB int64) *Engine {
 	if repositories == nil || issueReconciler == nil || commentReconciler == nil || pullRequestReconciler == nil || releaseReconciler == nil || git == nil || store == nil || len(namespaces) == 0 || githubToken == "" || forgejoToken == "" || maxConcurrency < 1 {
 		panic("reconciliation engine configuration is incomplete")
+	}
+	if maxRefSizeKB <= 0 {
+		maxRefSizeKB = defaultMaxRefSizeKB
 	}
 	return &Engine{
 		repositories: repositories, issues: issueReconciler, comments: commentReconciler,
@@ -57,8 +61,13 @@ func New(repositories *repository.Reconciler, issueReconciler *issues.Reconciler
 		git: git, store: store,
 		namespaces: append([]string(nil), namespaces...), githubToken: githubToken, forgejoToken: forgejoToken,
 		forgejoCloneBase: strings.TrimSuffix(strings.TrimRight(forgejoAPI, "/"), "/api/v1"), maxConcurrency: maxConcurrency,
+		maxRefSizeKB: maxRefSizeKB,
 	}
 }
+
+// defaultMaxRefSizeKB excludes repositories whose git history cannot fit in
+// the bounded workspace; operators can raise it, never disable the guard.
+const defaultMaxRefSizeKB = 8 << 20 // 8 GiB
 
 func (e *Engine) Discover(ctx context.Context, dryRun bool) (model.Inventory, error) {
 	return e.repositories.Discover(ctx, e.namespaces, dryRun)
@@ -181,6 +190,23 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 	lock := lockValue.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
+	if mapping.SizeKB > e.maxRefSizeKB {
+		// A repository whose history exceeds the bounded workspace is
+		// excluded from ref synchronization (never deleted): issues, PRs,
+		// comments, and releases still reconcile, and the exclusion is
+		// recorded so operators see it.
+		if !dryRun {
+			if err := e.store.AddConflict(ctx, model.Conflict{
+				Kind: "ref-sync-skipped", Repository: mapping.GitHubFullName,
+				ObjectKey:   "git-refs",
+				GitHubState: fmt.Sprintf("%d KiB", mapping.SizeKB), ForgejoState: fmt.Sprintf("limit %d KiB", e.maxRefSizeKB),
+				LastKnownState: "workspace-bound", CreatedAt: time.Now().UTC(),
+			}); err != nil {
+				return RepositoryResult{}, err
+			}
+		}
+		return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, nil
+	}
 	githubRemote := gitrefs.Remote{
 		URL: "https://github.com/" + mapping.GitHubFullName + ".git", Username: "x-access-token", Token: e.githubToken,
 	}

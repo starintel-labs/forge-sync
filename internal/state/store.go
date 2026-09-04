@@ -159,18 +159,19 @@ func (s *Store) UpsertRepository(ctx context.Context, mapping model.RepositoryMa
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO repository_mappings
-    (github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    (github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, size_kb, last_state_hash, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(github_id) DO UPDATE SET
     github_full_name = excluded.github_full_name,
     forgejo_owner = excluded.forgejo_owner,
     forgejo_name = excluded.forgejo_name,
     visibility = excluded.visibility,
     archived = excluded.archived,
+    size_kb = excluded.size_kb,
     last_state_hash = excluded.last_state_hash,
     updated_at = excluded.updated_at`,
 		mapping.GitHubID, mapping.GitHubFullName, mapping.ForgejoOwner, mapping.ForgejoName,
-		mapping.Visibility, boolInt(mapping.Archived), mapping.LastStateHash, mapping.UpdatedAt.UTC().Format(time.RFC3339Nano))
+		mapping.Visibility, boolInt(mapping.Archived), mapping.SizeKB, mapping.LastStateHash, mapping.UpdatedAt.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("upsert repository mapping: %w", err)
 	}
@@ -179,7 +180,7 @@ ON CONFLICT(github_id) DO UPDATE SET
 
 func (s *Store) RepositoryByGitHubID(ctx context.Context, githubID int64) (model.RepositoryMapping, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at
+SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, size_kb, last_state_hash, updated_at
 FROM repository_mappings WHERE github_id = ?`, githubID)
 	mapping, err := scanRepository(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -193,7 +194,7 @@ FROM repository_mappings WHERE github_id = ?`, githubID)
 
 func (s *Store) RepositoriesByForgejoPath(ctx context.Context, owner, name string) ([]model.RepositoryMapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at
+SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, size_kb, last_state_hash, updated_at
 FROM repository_mappings WHERE lower(forgejo_owner) = lower(?) AND lower(forgejo_name) = lower(?) ORDER BY github_full_name`, owner, name)
 	if err != nil {
 		return nil, fmt.Errorf("find repository mappings by Forgejo path: %w", err)
@@ -212,7 +213,7 @@ FROM repository_mappings WHERE lower(forgejo_owner) = lower(?) AND lower(forgejo
 
 func (s *Store) ListRepositories(ctx context.Context) ([]model.RepositoryMapping, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, last_state_hash, updated_at
+SELECT github_id, github_full_name, forgejo_owner, forgejo_name, visibility, archived, size_kb, last_state_hash, updated_at
 FROM repository_mappings ORDER BY github_full_name`)
 	if err != nil {
 		return nil, fmt.Errorf("list repository mappings: %w", err)
@@ -384,7 +385,7 @@ func scanRepository(row scanner) (model.RepositoryMapping, error) {
 	var visibility string
 	var archived int
 	var updated string
-	if err := row.Scan(&mapping.GitHubID, &mapping.GitHubFullName, &mapping.ForgejoOwner, &mapping.ForgejoName, &visibility, &archived, &mapping.LastStateHash, &updated); err != nil {
+	if err := row.Scan(&mapping.GitHubID, &mapping.GitHubFullName, &mapping.ForgejoOwner, &mapping.ForgejoName, &visibility, &archived, &mapping.SizeKB, &mapping.LastStateHash, &updated); err != nil {
 		return model.RepositoryMapping{}, err
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, updated)

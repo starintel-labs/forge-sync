@@ -68,6 +68,10 @@ All configuration is environment-only. Secrets must be injected at runtime
 | `FORGE_SYNC_API_MAX_ATTEMPTS` | `4` | Bounded attempts per API call (incl. first) |
 | `FORGE_SYNC_API_RETRY_BASE` | `1s` | Exponential backoff base delay |
 | `FORGE_SYNC_API_RETRY_MAX` | `30s` | Backoff ceiling; also caps server `Retry-After` for ordinary transients |
+| `FORGE_SYNC_GITHUB_MIN_INTERVAL` | `0` (off) | Minimum spacing between GitHub API requests to protect quota (e.g. `1500ms`) |
+| `FORGE_SYNC_FORGEJO_MIN_INTERVAL` | `0` (off) | Minimum spacing between Gitea API requests |
+| `FORGE_SYNC_MAX_REF_SIZE_MB` | `8192` | Ref sync skips repositories whose GitHub size exceeds this (recorded as `ref-sync-skipped`; never deleted) |
+| `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(identity)* | `namespace:owner` pairs redirecting GitHub namespaces to Gitea owners (e.g. `lost-rob0t:nsaspy`) |
 | `FORGE_SYNC_FORGEJO_OWNER_MAP` | *(unset)* | Comma list of `github-namespace:forgejo-owner` redirects, e.g. `starintel-labs:nsaspy`; keys must be configured namespaces |
 
 Transient API failures (HTTP `429`, `5xx`, network errors) are retried with a

@@ -40,6 +40,10 @@ type Client struct {
 	throttleLowMark int64
 	throttleNow     func() time.Time
 	throttleSleep   func(context.Context, time.Duration) error
+
+	paceMu       sync.Mutex
+	paceInterval time.Duration
+	paceLast     time.Time
 }
 
 type APIError struct {
@@ -95,6 +99,23 @@ func WithThrottle(maxWait time.Duration, lowRemaining int64) Option {
 			c.throttleLowMark = lowRemaining
 		}
 	}
+}
+
+// SetThrottleClockForTest replaces the clock and sleeper used by pacing and
+// rate-limit waits. It exists for tests only.
+func (c *Client) SetThrottleClockForTest(now func() time.Time, sleep func(context.Context, time.Duration) error) {
+	if now != nil {
+		c.throttleNow = now
+	}
+	if sleep != nil {
+		c.throttleSleep = sleep
+	}
+}
+
+// WithPacing enforces a minimum spacing between consecutive API requests so
+// a full reconciliation cannot exhaust the operator's quota. Zero disables.
+func WithPacing(interval time.Duration) Option {
+	return func(c *Client) { c.paceInterval = interval }
 }
 
 func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
@@ -682,6 +703,7 @@ type repository struct {
 	Visibility    string    `json:"visibility"`
 	Private       bool      `json:"private"`
 	Archived      bool      `json:"archived"`
+	SizeKB        int64     `json:"size"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	Owner         struct {
 		Login string `json:"login"`
@@ -708,6 +730,7 @@ func (r repository) model() model.Repository {
 		DefaultBranch: r.DefaultBranch,
 		Visibility:    visibility,
 		Archived:      r.Archived,
+		SizeKB:        r.SizeKB,
 		UpdatedAt:     r.UpdatedAt,
 	}
 }
@@ -739,6 +762,9 @@ func (c *Client) getAll(ctx context.Context, path string, destination *[]reposit
 }
 
 func (c *Client) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	if err := c.pace(ctx); err != nil {
+		return nil, err
+	}
 	if err := c.obeyRateLimit(ctx); err != nil {
 		return nil, err
 	}
@@ -776,6 +802,25 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 		return nil, apiErr
 	}
 	return response, nil
+}
+
+// pace serializes request starts at least paceInterval apart so the client
+// cannot burst through the operator's API quota.
+func (c *Client) pace(ctx context.Context) error {
+	if c.paceInterval <= 0 {
+		return nil
+	}
+	c.paceMu.Lock()
+	now := c.throttleNow()
+	wait := c.paceInterval - now.Sub(c.paceLast)
+	if wait > 0 {
+		c.paceLast = now.Add(wait)
+		c.paceMu.Unlock()
+		return c.throttleSleep(ctx, wait)
+	}
+	c.paceLast = now
+	c.paceMu.Unlock()
+	return nil
 }
 
 // obeyRateLimit blocks before a request when the last observed budget is

@@ -125,12 +125,12 @@ func openRuntime(cfg config.Config) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
-	githubClient, err := github.New(cfg.GitHubAPI, cfg.GitHubToken, cfg.RequestTimeout, github.WithRetry(cfg.APIRetry))
+	githubClient, err := github.New(cfg.GitHubAPI, cfg.GitHubToken, cfg.RequestTimeout, github.WithRetry(cfg.APIRetry), github.WithPacing(cfg.GitHubMinInterval))
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
-	forgejoClient, err := forgejo.New(cfg.ForgejoAPI, cfg.ForgejoToken, cfg.RequestTimeout, forgejo.WithRetry(cfg.APIRetry))
+	forgejoClient, err := forgejo.New(cfg.ForgejoAPI, cfg.ForgejoToken, cfg.RequestTimeout, forgejo.WithRetry(cfg.APIRetry), forgejo.WithPacing(cfg.ForgejoMinInterval))
 	if err != nil {
 		store.Close()
 		return nil, err
@@ -143,7 +143,7 @@ func openRuntime(cfg config.Config) (*application, error) {
 	gitSynchronizer := gitrefs.NewSynchronizer(store, cfg.GitTimeout)
 	engine := reconcile.New(
 		repositories, issueReconciler, commentReconciler, pullRequestReconciler, releaseReconciler, gitSynchronizer, store,
-		cfg.Namespaces, cfg.GitHubToken, cfg.ForgejoToken, cfg.ForgejoAPI, cfg.MaxConcurrency,
+		cfg.Namespaces, cfg.GitHubToken, cfg.ForgejoToken, cfg.ForgejoAPI, cfg.MaxConcurrency, cfg.MaxRefSizeKB,
 	)
 	return &application{store: store, engine: engine}, nil
 }

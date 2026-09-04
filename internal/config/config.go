@@ -29,8 +29,11 @@ type Config struct {
 	ReconcileInterval    time.Duration
 	RequestTimeout       time.Duration
 	GitTimeout           time.Duration
+	GitHubMinInterval    time.Duration
+	ForgejoMinInterval   time.Duration
 	MaxConcurrency       int
 	MaxWebhookBody       int64
+	MaxRefSizeKB         int64
 	APIRetry             api.RetryPolicy
 	ForgejoOwnerMap      map[string]string
 }
@@ -49,8 +52,11 @@ func FromEnvironment() (Config, error) {
 		ReconcileInterval:    durationOr("FORGE_SYNC_RECONCILE_INTERVAL", 5*time.Minute),
 		RequestTimeout:       durationOr("FORGE_SYNC_REQUEST_TIMEOUT", 30*time.Second),
 		GitTimeout:           durationOr("FORGE_SYNC_GIT_TIMEOUT", 5*time.Minute),
+		GitHubMinInterval:    durationOr("FORGE_SYNC_GITHUB_MIN_INTERVAL", 0),
+		ForgejoMinInterval:   durationOr("FORGE_SYNC_FORGEJO_MIN_INTERVAL", 0),
 		MaxConcurrency:       intOr("FORGE_SYNC_MAX_CONCURRENCY", 4),
 		MaxWebhookBody:       int64Or("FORGE_SYNC_MAX_WEBHOOK_BODY", 1<<20),
+		MaxRefSizeKB:         int64Or("FORGE_SYNC_MAX_REF_SIZE_MB", 8<<10) << 10,
 		APIRetry: api.RetryPolicy{
 			MaxAttempts: intOr("FORGE_SYNC_API_MAX_ATTEMPTS", 4),
 			BaseDelay:   durationOr("FORGE_SYNC_API_RETRY_BASE", time.Second),
@@ -100,6 +106,9 @@ func (c Config) Validate() error {
 	}
 	if c.RequestTimeout <= 0 || c.GitTimeout <= 0 {
 		return errors.New("request and Git timeouts must be positive")
+	}
+	if c.GitHubMinInterval < 0 || c.ForgejoMinInterval < 0 {
+		return errors.New("request intervals must not be negative")
 	}
 	if err := c.APIRetry.Validate(); err != nil {
 		return fmt.Errorf("API retry policy: %w", err)

@@ -170,7 +170,7 @@ func mappingForPair(source model.Repository, forgejoOwner, forgejoName string) m
 	return model.RepositoryMapping{
 		GitHubID: source.ID, GitHubFullName: source.FullName,
 		ForgejoOwner: forgejoOwner, ForgejoName: forgejoName,
-		Visibility: source.Visibility, Archived: source.Archived,
+		Visibility: source.Visibility, Archived: source.Archived, SizeKB: source.SizeKB,
 		LastStateHash: repositoryHash(source), UpdatedAt: time.Now().UTC(),
 	}
 }
@@ -179,7 +179,7 @@ func mappingFor(repository model.Repository) model.RepositoryMapping {
 	return model.RepositoryMapping{
 		GitHubID: repository.ID, GitHubFullName: repository.FullName,
 		ForgejoOwner: repository.Owner, ForgejoName: repository.Name,
-		Visibility: repository.Visibility, Archived: repository.Archived,
+		Visibility: repository.Visibility, Archived: repository.Archived, SizeKB: repository.SizeKB,
 		LastStateHash: repositoryHash(repository), UpdatedAt: time.Now().UTC(),
 	}
 }

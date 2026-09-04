@@ -19,6 +19,7 @@ type Repository struct {
 	DefaultBranch string
 	Visibility    Visibility
 	Archived      bool
+	SizeKB        int64
 	UpdatedAt     time.Time
 }
 
@@ -29,6 +30,7 @@ type RepositoryMapping struct {
 	ForgejoName    string
 	Visibility     Visibility
 	Archived       bool
+	SizeKB         int64
 	LastStateHash  string
 	UpdatedAt      time.Time
 }

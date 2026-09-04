@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/starintel-labs/forge-sync/internal/api"
@@ -32,6 +33,10 @@ type Client struct {
 	migrationHTTP  *http.Client
 	migrateTimeout time.Duration
 	Retry          api.RetryPolicy
+
+	paceMu       sync.Mutex
+	paceInterval time.Duration
+	paceLast     time.Time
 }
 
 type APIError struct {
@@ -60,6 +65,30 @@ type Option func(*Client)
 // WithRetry overrides the default bounded retry policy.
 func WithRetry(policy api.RetryPolicy) Option {
 	return func(c *Client) { c.Retry = policy }
+}
+
+// WithPacing enforces a minimum spacing between consecutive API requests.
+// Zero disables pacing.
+func WithPacing(interval time.Duration) Option {
+	return func(c *Client) { c.paceInterval = interval }
+}
+
+// pace serializes request starts at least paceInterval apart.
+func (c *Client) pace(ctx context.Context) error {
+	if c.paceInterval <= 0 {
+		return nil
+	}
+	c.paceMu.Lock()
+	now := time.Now()
+	wait := c.paceInterval - now.Sub(c.paceLast)
+	if wait > 0 {
+		c.paceLast = now.Add(wait)
+		c.paceMu.Unlock()
+		return api.Sleep(ctx, wait)
+	}
+	c.paceLast = now
+	c.paceMu.Unlock()
+	return nil
 }
 
 func New(baseURL, token string, timeout time.Duration, options ...Option) (*Client, error) {
@@ -759,6 +788,9 @@ func (c *Client) doJSONWith(ctx context.Context, client *http.Client, method, en
 func (c *Client) doJSONWithPolicy(ctx context.Context, client *http.Client, policy api.RetryPolicy, method, endpoint string, requestBody, responseBody any) (int, error) {
 	var status int
 	err := policy.Do(ctx, func() error {
+		if err := c.pace(ctx); err != nil {
+			return err
+		}
 		var body io.Reader
 		if requestBody != nil {
 			encoded, err := json.Marshal(requestBody)

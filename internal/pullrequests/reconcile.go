@@ -228,11 +228,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 				continue
 			}
 			// A pull request for these refs may already exist without a
-			// usable pairing signal; adopt it instead of failing.
-			if existing, found := adoptPullRequest(forgejoPullRequests, githubItem, consumedForgejo); found {
+			// usable pairing signal; adopt it (title-tolerant first, then
+			// refs-only) instead of failing.
+			existing, found := adoptPullRequest(forgejoPullRequests, githubItem, consumedForgejo)
+			if !found {
+				existing, found = adoptPullRequestByRefs(forgejoPullRequests, githubItem, consumedForgejo)
+			}
+			if found {
 				created = existing
 			} else {
-				return fmt.Errorf("create Forgejo pull request from GitHub pull request %d: %w", githubItem.ID, err)
+				if forgejoErr == nil || forgejoErr.StatusCode != http.StatusConflict {
+					return fmt.Errorf("create Forgejo pull request from GitHub pull request %d: %w", githubItem.ID, err)
+				}
+				// 409 without an adoptable counterpart: record and move on.
+				if err := r.store.AddConflict(ctx, model.Conflict{
+					Kind: "pull-request-duplicate", Repository: repository.GitHubFullName,
+					ObjectKey:   fmt.Sprintf("github:%d/forgejo:-", githubItem.ID),
+					GitHubState: Hash(githubItem), ForgejoState: "occupied-refs", LastKnownState: "unpaired",
+					CreatedAt: time.Now().UTC(),
+				}); err != nil {
+					return err
+				}
+				consumedGitHub[githubItem.ID] = true
+				continue
 			}
 		}
 		if err := validatePullRequest(created); err != nil {
@@ -441,6 +459,20 @@ func adoptPullRequest(candidates []model.PullRequest, githubItem model.PullReque
 			continue
 		}
 		return candidate, true
+	}
+	return model.PullRequest{}, false
+}
+
+// adoptPullRequestByRefs is the last-resort adoption when the forge reports
+// the refs are occupied but titles have drifted beyond normalization.
+func adoptPullRequestByRefs(candidates []model.PullRequest, githubItem model.PullRequest, consumed map[int64]bool) (model.PullRequest, bool) {
+	for _, candidate := range candidates {
+		if consumed[candidate.ID] {
+			continue
+		}
+		if candidate.Head == githubItem.Head && candidate.Base == githubItem.Base {
+			return candidate, true
+		}
 	}
 	return model.PullRequest{}, false
 }
