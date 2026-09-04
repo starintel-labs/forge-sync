@@ -106,6 +106,16 @@ func run(arguments []string) error {
 			return err
 		}
 		return writeJSON(conflicts)
+	case "wire-webhooks":
+		flags := flag.NewFlagSet("wire-webhooks", flag.ContinueOnError)
+		dryRun := flags.Bool("dry-run", false, "report planned webhook changes without any mutation")
+		if err := flags.Parse(arguments[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return usageError()
+		}
+		return wireWebhooks(ctx, cfg, runtime, *dryRun)
 	case "serve":
 		if len(arguments) != 1 {
 			return usageError()
@@ -117,8 +127,10 @@ func run(arguments []string) error {
 }
 
 type application struct {
-	store  *state.Store
-	engine *reconcile.Engine
+	store   *state.Store
+	engine  *reconcile.Engine
+	github  *github.Client
+	forgejo *forgejo.Client
 }
 
 func openRuntime(cfg config.Config) (*application, error) {
@@ -147,7 +159,16 @@ func openRuntime(cfg config.Config) (*application, error) {
 		repositories, issueReconciler, commentReconciler, pullRequestReconciler, releaseReconciler, actionSecretReconciler, gitSynchronizer, store,
 		cfg.Namespaces, cfg.GitHubToken, cfg.ForgejoToken, cfg.ForgejoAPI, cfg.MaxConcurrency, cfg.MaxRefSizeKB,
 	)
-	return &application{store: store, engine: engine}, nil
+	return &application{store: store, engine: engine, github: githubClient, forgejo: forgejoClient}, nil
+}
+
+func wireWebhooks(ctx context.Context, cfg config.Config, runtime *application, dryRun bool) error {
+	wiring := webhooks.NewWiring(runtime.github, runtime.forgejo, cfg.Namespaces)
+	report, err := wiring.Wire(ctx, cfg.GitHubWebhookURL, cfg.ForgejoWebhookURL, cfg.GitHubWebhookSecret, cfg.ForgejoWebhookSecret, dryRun)
+	if err != nil {
+		return err
+	}
+	return writeJSON(report)
 }
 
 func serve(cfg config.Config, runtime *application) error {
@@ -253,5 +274,5 @@ func writeJSON(value any) error {
 }
 
 func usageError() error {
-	return errors.New("usage: forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|serve}")
+	return errors.New("usage: forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|wire-webhooks [--dry-run]|serve}")
 }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/starintel-labs/forge-sync/internal/api"
 	"github.com/starintel-labs/forge-sync/internal/model"
+	"github.com/starintel-labs/forge-sync/internal/webhooks"
 )
 
 const (
@@ -845,4 +846,106 @@ func retryAfter(header http.Header) time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 	return 0
+}
+
+type forgejoHookConfig struct {
+	URL         string `json:"url"`
+	ContentType string `json:"content_type"`
+	Secret      string `json:"secret,omitempty"`
+}
+
+type forgejoWebhook struct {
+	ID     int64             `json:"id"`
+	Events []string          `json:"events"`
+	Active bool              `json:"active"`
+	Config forgejoHookConfig `json:"config"`
+}
+
+func (w forgejoWebhook) model() webhooks.Hook {
+	return webhooks.Hook{ID: w.ID, URL: w.Config.URL, Events: append([]string(nil), w.Events...), Active: w.Active}
+}
+
+// ListOrgWebhooks returns the org's webhooks; found is false when the
+// namespace is not an organization (HTTP 404).
+func (c *Client) ListOrgWebhooks(ctx context.Context, org string) ([]webhooks.Hook, bool, error) {
+	base := c.baseURL + "/api/v1/orgs/" + url.PathEscape(org) + "/hooks?limit=50"
+	var hooks []webhooks.Hook
+	for page := 1; page <= 1000; page++ {
+		var batch []forgejoWebhook
+		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+strconv.Itoa(page), nil, &batch); err != nil {
+			var apiErr *APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("list Forgejo org webhooks for %s: %w", org, err)
+		}
+		for _, hook := range batch {
+			hooks = append(hooks, hook.model())
+		}
+		if len(batch) < 50 {
+			return hooks, true, nil
+		}
+	}
+	return hooks, true, nil
+}
+
+func (c *Client) ListRepoWebhooks(ctx context.Context, owner, name string) ([]webhooks.Hook, error) {
+	base := c.baseURL + "/api/v1/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/hooks?limit=50"
+	var hooks []webhooks.Hook
+	for page := 1; page <= 1000; page++ {
+		var batch []forgejoWebhook
+		if _, err := c.doJSON(ctx, http.MethodGet, base+"&page="+strconv.Itoa(page), nil, &batch); err != nil {
+			return nil, fmt.Errorf("list Forgejo webhooks for %s/%s: %w", owner, name, err)
+		}
+		for _, hook := range batch {
+			hooks = append(hooks, hook.model())
+		}
+		if len(batch) < 50 {
+			return hooks, nil
+		}
+	}
+	return hooks, nil
+}
+
+func (c *Client) CreateOrgWebhook(ctx context.Context, org string, hook webhooks.Hook, secret string) error {
+	endpoint := c.baseURL + "/api/v1/orgs/" + url.PathEscape(org) + "/hooks"
+	return c.doWebhookWrite(ctx, http.MethodPost, endpoint, hook, secret)
+}
+
+func (c *Client) UpdateOrgWebhook(ctx context.Context, org string, id int64, hook webhooks.Hook, secret string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/orgs/%s/hooks/%d", c.baseURL, url.PathEscape(org), id)
+	return c.doWebhookWrite(ctx, http.MethodPatch, endpoint, hook, secret)
+}
+
+func (c *Client) CreateRepoWebhook(ctx context.Context, owner, name string, hook webhooks.Hook, secret string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/hooks", c.baseURL, url.PathEscape(owner), url.PathEscape(name))
+	return c.doWebhookWrite(ctx, http.MethodPost, endpoint, hook, secret)
+}
+
+func (c *Client) UpdateRepoWebhook(ctx context.Context, owner, name string, id int64, hook webhooks.Hook, secret string) error {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/hooks/%d", c.baseURL, url.PathEscape(owner), url.PathEscape(name), id)
+	return c.doWebhookWrite(ctx, http.MethodPatch, endpoint, hook, secret)
+}
+
+// doWebhookWrite sends a Forgejo hook create or update payload. The hook
+// type stays "gitea": Forgejo keeps the Gitea webhook module name.
+type forgejoWebhookWrite struct {
+	Type   string            `json:"type"`
+	Config forgejoHookConfig `json:"config"`
+	Events []string          `json:"events"`
+	Active bool              `json:"active"`
+}
+
+func (c *Client) doWebhookWrite(ctx context.Context, method, endpoint string, hook webhooks.Hook, secret string) error {
+	payload := forgejoWebhookWrite{
+		Type:   "gitea",
+		Config: forgejoHookConfig{URL: hook.URL, ContentType: "json", Secret: secret},
+		Events: hook.Events,
+		Active: hook.Active,
+	}
+	_, err := c.doJSON(ctx, method, endpoint, payload, nil)
+	if err != nil {
+		return err
+	}
+	return nil
 }
