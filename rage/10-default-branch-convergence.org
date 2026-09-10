@@ -35,3 +35,8 @@
 - Ops evidence below (recorded by prolog-verify observe during execution).
 
 * Outcome
+- Ops evidence (all recorded by prolog-verify observe) :: before: Forgejo main=dd338d1 master=151cabb, GitHub main=master=dd338d1, GitHub HEAD -> =codex/forge-sync-handoff=. After: both forges =master=151cabbcfefde76f2fb1512c7e1aa93f9ef4d23e= with no =refs/heads/main= on either side; both HEAD symrefs -> =refs/heads/master=; GitHub =default_branch=master= (PATCH accepted).
+- Convergence step :: GitHub master fast-forwarded =dd338d1 -> 151cabb= by ordinary operator push (the #6 human-alignment path; no force).
+- Merge SHA :: =31dd9f7e8da5d7e93afc4e4cfc28d6c9180e5479= (PR #12 merged into Forgejo master with =--style merge=; issue #10 auto-closed by "Closes #10")
+- Exact-head gates :: forge CI green at PR head =223b794= (event =pull_request=) and at merge commit =31dd9f7= (event =push=); local gate =go build ./...=, =go vet ./...=, =go test ./...= green at =223b794= (prolog-verify observed).
+- Follow-up (infra-owned, out of this repo's scope) :: =starintel-infra/flake.lock= still pins forge-sync at =dd338d1= and the deployed service has not pushed to GitHub since 2026-09-08; updating that pin (and redeploying) is required for the service to resume automatic master convergence and to pick up the #6/#7 divergence policy.
