@@ -14,7 +14,7 @@ anywhere in its dependency graph.
 - **Visibility**: unknown or missing visibility always fails closed to
   *private*. An API failure is never interpreted as deletion or as a
   visibility change.
-- **Refs** (true two-way sync, Forgejo is the master forge):
+- **Refs** (true master-to-master sync, neither forge is privileged):
   - Every branch and tag ref on either forge participates; there is no
     prefix allow-list.
   - A ref that is behind on one forge fast-forwards from the other, in
@@ -22,10 +22,10 @@ anywhere in its dependency graph.
     Forgejo; Forgejo-only changes are pushed to GitHub).
   - A ref missing on one forge is copied from the other. Refs are never
     deleted by the policy.
-  - When histories truly diverge, Forgejo (`git.starintel.actor`) wins: its
-    state is force-enforced on the GitHub mirror and the overridden GitHub
-    SHA is recorded as a `git-ref-override` audit entry for recovery.
-    Forgejo history is never overwritten.
+  - When histories truly diverge, no side wins and nothing is force-pushed
+    in either direction: the divergence is recorded as a
+    `git-ref-divergence` conflict carrying both SHAs until a human resolves
+    it. History on neither forge is ever overwritten.
 - **Issues, comments, labels, milestones**: bidirectional reconciliation with
   durable stable-ID mappings, content state hashes, conflict recording, and
   loop suppression.
@@ -54,14 +54,15 @@ anywhere in its dependency graph.
 ### Conflict resolution
 
 Git refs are self-healing: a behind ref fast-forwards in whichever direction
-is needed, and on true divergence the master forge (Forgejo) is enforced on
-the GitHub mirror, with the overridden GitHub SHA recorded as a
-`git-ref-override` entry so it remains recoverable. For every other object
-the service never picks a winner: when both sides changed the same object
-since the last synchronized state, the object's divergent hashes are recorded
-in the `conflicts` table and surfaced by `forge-sync conflicts`, the
-`/metrics` endpoint, and the `inspect` subcommand. Operators resolve manually;
-the next reconciliation then treats the resolved state as canonical.
+is needed. On true divergence neither side is auto-resolved: both SHAs are
+recorded as a `git-ref-divergence` entry and no push is made in either
+direction until a human aligns one forge, after which ordinary fast-forward
+sync converges the other side. For every other object the service never
+picks a winner: when both sides changed the same object since the last
+synchronized state, the object's divergent hashes are recorded in the
+`conflicts` table and surfaced by `forge-sync conflicts`, the `/metrics`
+endpoint, and the `inspect` subcommand. Operators resolve manually; the next
+reconciliation then treats the resolved state as canonical.
 
 ## Configuration
 

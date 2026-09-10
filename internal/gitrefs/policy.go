@@ -16,22 +16,22 @@ const (
 )
 
 type Action struct {
-	Ref   string
-	SHA   string
-	From  Forge
-	To    Forge
-	Force bool
+	Ref  string
+	SHA  string
+	From Forge
+	To   Forge
 }
 
 type Ancestry func(ancestor, descendant string) (bool, error)
 
 // Plan derives the reconciliation actions for every branch and tag ref that
-// exists on either forge. Sync is two-way: a ref that is behind on one forge
-// fast-forwards from the other, in whichever direction that is. Forgejo is
-// the master forge: when the two sides truly diverge, its state is enforced
-// on the GitHub mirror and the overridden GitHub SHA is recorded for audit.
-// Refs are never deleted; a ref missing on one forge is copied from the
-// other, so history is only ever overwritten on GitHub, never on Forgejo.
+// exists on either forge. Sync is truly master-to-master: a ref that is
+// behind on one forge fast-forwards from the other, in whichever direction
+// that is, and neither forge is privileged. On true divergence no mutating
+// action is taken in either direction; the divergence is recorded as a
+// conflict carrying both SHAs so a human can resolve it, after which normal
+// fast-forward sync converges the other side. Refs are never deleted and
+// history is never force-overwritten on either forge.
 func Plan(repository string, githubRefs, forgejoRefs map[string]string, isAncestor Ancestry) ([]Action, []model.Conflict, error) {
 	if repository == "" || isAncestor == nil {
 		return nil, nil, fmt.Errorf("repository and ancestry checker are required")
@@ -65,9 +65,8 @@ func Plan(repository string, githubRefs, forgejoRefs map[string]string, isAncest
 				actions = append(actions, Action{Ref: ref, SHA: githubSHA, From: GitHub, To: Forgejo})
 				continue
 			}
-			actions = append(actions, Action{Ref: ref, SHA: forgejoSHA, From: Forgejo, To: GitHub, Force: true})
 			conflicts = append(conflicts, model.Conflict{
-				Kind: "git-ref-override", Repository: repository, ObjectKey: ref,
+				Kind: "git-ref-divergence", Repository: repository, ObjectKey: ref,
 				GitHubState: githubSHA, ForgejoState: forgejoSHA, CreatedAt: time.Now().UTC(),
 			})
 		}

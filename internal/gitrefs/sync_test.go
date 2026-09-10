@@ -34,7 +34,7 @@ func TestSynchronizerFastForwardsBehindForgejo(t *testing.T) {
 	}
 }
 
-func TestSynchronizerEnforcesForgejoOnDivergence(t *testing.T) {
+func TestSynchronizerRecordsDivergenceWithoutAction(t *testing.T) {
 	t.Parallel()
 	fixture := newGitFixture(t)
 	fixture.commit(t, "A")
@@ -48,21 +48,31 @@ func TestSynchronizerEnforcesForgejoOnDivergence(t *testing.T) {
 	forgejoBefore := fixture.ref(t, fixture.forgejo, "refs/heads/main")
 	githubBefore := fixture.ref(t, fixture.github, "refs/heads/main")
 
-	result, err := fixture.synchronizer(t).Sync(context.Background(), "starintel-labs/example", gitrefs.Remote{URL: fixture.github}, gitrefs.Remote{URL: fixture.forgejo}, false)
+	store, err := state.Open(filepath.Join(fixture.root, "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Actions) != 1 || len(result.Conflicts) != 1 {
-		t.Fatalf("unexpected result: %#v", result)
+	t.Cleanup(func() { _ = store.Close() })
+
+	result, err := gitrefs.NewSynchronizer(store, 10*time.Second).Sync(context.Background(), "starintel-labs/example", gitrefs.Remote{URL: fixture.github}, gitrefs.Remote{URL: fixture.forgejo}, false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !result.Actions[0].Force || result.Actions[0].To != gitrefs.GitHub {
-		t.Fatalf("unexpected action: %#v", result.Actions[0])
+	if len(result.Actions) != 0 || len(result.Conflicts) != 1 {
+		t.Fatalf("unexpected result: %#v", result)
 	}
 	if got := fixture.ref(t, fixture.forgejo, "refs/heads/main"); got != forgejoBefore {
 		t.Fatalf("divergent Forgejo main changed from %s to %s", forgejoBefore, got)
 	}
-	if got := fixture.ref(t, fixture.github, "refs/heads/main"); got != forgejoBefore || got == githubBefore {
-		t.Fatalf("GitHub main = %s, want enforced Forgejo state %s", got, forgejoBefore)
+	if got := fixture.ref(t, fixture.github, "refs/heads/main"); got != githubBefore {
+		t.Fatalf("divergent GitHub main changed from %s to %s", githubBefore, got)
+	}
+	conflicts, err := store.ListConflicts(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conflicts) != 1 || conflicts[0].Kind != "git-ref-divergence" || conflicts[0].GitHubState != githubBefore || conflicts[0].ForgejoState != forgejoBefore {
+		t.Fatalf("divergence not persisted with both SHAs: %#v", conflicts)
 	}
 }
 
