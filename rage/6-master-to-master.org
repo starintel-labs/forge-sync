@@ -25,3 +25,7 @@
 
 * Auto-RAGE decision
 - Decision :: Approved for realization within this run: symmetric divergence policy (record, do not force), removal of =Force= from =gitrefs.Action= and of =--force= from the push path, README and design-comment updates, and tests proving divergence records a conflict with both SHAs and produces no action while every other path stays two-way.
+
+* Outcome
+- Merge SHA :: =79733bce482bfccc6e5c2a7295e9e1a58534bb36= (PR #7 merged into Forgejo master)
+- Gate :: =go build ./...=, =go vet ./...=, =go test ./...= green at the merged head; recorded by prolog-verify
