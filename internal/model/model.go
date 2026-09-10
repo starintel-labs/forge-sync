@@ -133,6 +133,7 @@ type Ref struct {
 }
 
 type Conflict struct {
+	ID             int64
 	Kind           string
 	Repository     string
 	ObjectKey      string
@@ -140,6 +141,7 @@ type Conflict struct {
 	ForgejoState   string
 	LastKnownState string
 	CreatedAt      time.Time
+	ResolvedAt     *time.Time
 }
 
 type Inventory struct {

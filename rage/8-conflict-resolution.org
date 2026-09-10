@@ -1,0 +1,37 @@
+* Run identity
+- Consumed issue :: #8
+- Branch :: =rage/8-conflict-resolution=
+- RAGE start commit :: =ec32043ec0d5966162930559383187c11d8ba6e9=
+
+* Research
+- Issue evidence :: =migrations/001_init.sql= defines =conflicts.resolved_at= (nullable TEXT); =internal/state/store.go:81= counts =WHERE resolved_at IS NULL= and =:503= lists =WHERE resolved_at IS NULL=; no code path ever writes =resolved_at=, so every recorded conflict (release conflicts, =git-ref-divergence= since #6/#7) stays unresolved forever and the =forge_sync_conflicts= metric and =forge-sync conflicts= output grow without bound.
+- Schema :: =conflicts(id INTEGER PRIMARY KEY AUTOINCREMENT, kind, repository, object_key, github_state, forgejo_state, last_known_state, resolved_at, created_at, UNIQUE(kind, repository, object_key, github_state, forgejo_state))= — a stable row ID already exists but is never surfaced by =model.Conflict= or =ListConflicts=.
+- Existing store semantics :: =AddConflict= dedups on the unique tuple with =ON CONFLICT DO NOTHING=, so repeated reconciliations keep one row per distinct divergence — the autoincrement ID is therefore a stable operator handle. =ClaimWebhookDelivery= establishes the repo pattern for boolean-result mutations =(bool, error)= with =RowsAffected= checks.
+- CLI today :: =forge-sync conflicts= accepts no arguments (=main.go:100-108=) and emits =writeJSON(conflicts)= from =ListConflicts=; the usage string advertises =conflicts=. Reconcile path never touches resolution (grep: no writer of =resolved_at=).
+- README contract :: "Operators resolve manually; the next reconciliation then treats the resolved state as canonical" — the resolution half is unimplemented.
+
+* Design
+- Model :: =model.Conflict= gains =ID int64= and =ResolvedAt *time.Time= (nil = unresolved; JSON =null=). Additive fields only; existing JSON consumers see two new keys.
+- Store :: =ListConflicts= also selects =id= (stable row IDs surfaced). New =ResolveConflict(ctx, id) (model.Conflict, bool, error)=: a single =UPDATE conflicts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL= followed by =SELECT= of that row; =false= means "no unresolved conflict with this ID" (unknown ID or already resolved) with *zero mutation*. The =AND resolved_at IS NULL= predicate makes resolution idempotent and never resurrects an already-resolved row. The repository is never deleted.
+- CLI :: =forge-sync conflicts= keeps listing unresolved rows (now with IDs); =forge-sync conflicts resolve <id>= resolves exactly that row and prints the resolved row (with =resolved_at=) as the audit confirmation; a non-integer ID or wrong arity is a usage error; an unknown ID fails loudly without mutating. Usage string updated.
+- Dry-run discipline :: the only caller of =ResolveConflict= is the explicit operator command; the reconcile engine, webhook server, and scheduler never resolve. No =--dry-run= interaction needed because resolving is itself the explicit, non-automated action.
+- No auto-resolution :: nothing in =Plan= or the reconcilers consults =resolved_at=; the #6 human-aligns-one-forge contract is unchanged — resolving a =git-ref-divergence= row only clears it from the unresolved surface after the human has aligned the forges by pushing the winning SHA (ordinary fast-forward then converges).
+- Compatibility :: no schema change (existing column); =conflicts= JSON gains =id= and =resolved_at=null= keys; =inspect= embeds the enriched conflict objects; historical rows get IDs on open (autoincrement persists) so the first =forge-sync conflicts= listing already shows actionable IDs.
+- Rejected alternatives :: deleting rows after resolution (violates scope guard and auditability); a =resolved_by/-note= audit column (schema change beyond the smallest coherent change); auto-resolving when the two forges now agree (heuristic resolution is explicitly out of scope — the operator decides what "resolved" means).
+
+* Adversarial review
+- Race: two operators resolve the same ID concurrently :: the =WHERE ... AND resolved_at IS NULL= predicate means exactly one UPDATE wins; the loser sees 0 rows affected and gets a clean "not unresolved" failure. No double-write, no corruption.
+- Race: resolution vs. a concurrent re-recording of the same divergence :: =AddConflict= uses =ON CONFLICT DO NOTHING= keyed on the SHA tuple, so a re-observation of the *same* divergence cannot create a second row or clear =resolved_at=; a *changed* SHA pair is a genuinely new conflict and gets a new row — correct, because the divergence is factually new.
+- Accidental mass resolution :: the CLI resolves exactly one ID per invocation; no wildcard/batch path exists to misuse.
+- Unknown/typo IDs :: fail loudly with a non-zero exit and no DB change (tested).
+- Auditing :: resolved rows stay in the table with =resolved_at= set (verified by reopening the store and by the returned conflict); the unresolved list and the =forge_sync_conflicts= metric exclude them.
+- Stable IDs :: autoincrement IDs never change; the unique-tuple dedup keeps a given divergence pinned to one ID across reconciliation cycles, so "stable row ID" holds in practice.
+
+* Auto-RAGE decision
+- Decision :: Approved for realization within this run: add =ID=/=ResolvedAt= to =model.Conflict=, surface =id= in =ListConflicts=, add =ResolveConflict= (predicate-guarded UPDATE + row read-back, boolean not-found), extend the =conflicts= command with =resolve <id>=, update the usage string and README conflict-resolution wording, and prove it all with deterministic store tests (resolve excludes from list, row persists with non-null =resolved_at=, unknown ID fails without mutation) plus a package-main CLI test driving =run()= against a seeded temp state DB.
+
+* Realization
+- TDD :: store tests written first, proven red at the compile boundary (=model.Conflict= had no =ID=/=ResolvedAt=, no =ResolveConflict= — recorded by prolog-verify observe), then implemented and proven green; CLI tests added for resolve/list/unknown/malformed paths via =run()= against a seeded temp state DB.
+- CI gate caught a real defect :: the first PR run (=33b053e=, run id 3631) failed in 5s while the same tree passed locally. Root cause, reproduced with =env -i go test ./cmd/...=: the CLI tests depended on ambient =FORGE_SYNC_*= variables — =config.FromEnvironment= rejects empty webhook secrets and the client constructors reject empty tokens, so every =cmd= test failed on the clean runner. Fixed in =d9e8786= by pinning all required variables to inert =.invalid= values and a temp state path (=hermeticEnvironment=); the full =env -i go test ./...= passes (14 packages, prolog-verify observed). The runner-local differential was isolated by a bisect push (gate restricted to =./internal/...= = green at =3fe29ee=, then restored to the full gate). Both forge runs are recorded run-log evidence; the bisect commit never merged.
+
+* Outcome
