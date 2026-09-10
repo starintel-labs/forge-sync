@@ -195,5 +195,8 @@ go vet ./...        # static checks
 go test ./...       # unit + local git integration tests (no network)
 ```
 
+Forgejo Actions runs this gate on every pull request and on pushes to
+`master` (`.forgejo/workflows/ci.yml`).
+
 Migrations are embedded SQL files under `migrations/` applied in order on
 startup; they are transactional and versioned.
