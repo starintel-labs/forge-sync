@@ -30,4 +30,8 @@
 * Auto-RAGE decision
 - Decision :: Approved for realization within this run: add =ID=/=ResolvedAt= to =model.Conflict=, surface =id= in =ListConflicts=, add =ResolveConflict= (predicate-guarded UPDATE + row read-back, boolean not-found), extend the =conflicts= command with =resolve <id>=, update the usage string and README conflict-resolution wording, and prove it all with deterministic store tests (resolve excludes from list, row persists with non-null =resolved_at=, unknown ID fails without mutation) plus a package-main CLI test driving =run()= against a seeded temp state DB.
 
+* Realization
+- TDD :: store tests written first, proven red at the compile boundary (=model.Conflict= had no =ID=/=ResolvedAt=, no =ResolveConflict= — recorded by prolog-verify observe), then implemented and proven green; CLI tests added for resolve/list/unknown/malformed paths via =run()= against a seeded temp state DB.
+- CI gate caught a real defect :: the first PR run (=33b053e=, run id 3631) failed in 5s while the same tree passed locally. Root cause, reproduced with =env -i go test ./cmd/...=: the CLI tests depended on ambient =FORGE_SYNC_*= variables — =config.FromEnvironment= rejects empty webhook secrets and the client constructors reject empty tokens, so every =cmd= test failed on the clean runner. Fixed in =d9e8786= by pinning all required variables to inert =.invalid= values and a temp state path (=hermeticEnvironment=); the full =env -i go test ./...= passes (14 packages, prolog-verify observed). The runner-local differential was isolated by a bisect push (gate restricted to =./internal/...= = green at =3fe29ee=, then restored to the full gate). Both forge runs are recorded run-log evidence; the bisect commit never merged.
+
 * Outcome
