@@ -1,0 +1,36 @@
+* Run identity
+- Consumed issue :: #9
+- Branch :: =rage/9-forgejo-actions-ci=
+- RAGE start commit :: =47f84be32bf52f4a3e4f42559bbf8dab53cf9cae=
+
+* Research
+- Issue evidence :: Forgejo issue #9: no CI exists (no =.forgejo/workflows/=, =.gitea/= or =.github/= workflow directories); README "Development" defines the gate =go build ./... && go vet ./... && go test ./...= and states tests are offline (no network); merges currently rely on author-local gates only (PR #7 merged with local-gate-only evidence).
+- Instance reality :: Forgejo =git.starintel.actor= v15.0.6; repo =starintel-labs/forge-sync= has =has_actions=true= and zero recorded runs; repo-level and org-level runner lists are empty because runners are registered instance-wide (global registration token minted by =forgejo actions generate-runner-token=, per =starintel-infra= =modules/forgejo-runner.nix=).
+- Runner inventory (infra-owned, =modules/forgejo-runner.nix=) :: labels =ubuntu-latest= (docker catthehacker), =ubuntu-24.04=, =ubuntu-22.04=, =kali=, =arch=, =docker= (node:22-bookworm), =nixos= (=host=), =deploy= (=host=, CD-only). Capacity 2 per runner, per-container memory cap 2g, job timeout 48h. Control-plane guest OOM-wedged twice in the past under unbounded concurrent CI.
+- Proven execution path :: =starintel-labs/starintel-infra= =.forgejo/workflows/check.yml= (=runs-on: nixos=, =actions/checkout@v4=, =nix run .#deploy -- validate=) has 236 recorded runs; most recent green run =2026-09-09T19:14:07Z -> 2026-09-09T19:25:53Z=. The =nixos= host runner is live and executes checkout + nix steps. Docker-label execution on this instance is not evidenced (smoke workflow is =workflow_dispatch=-only; workflows-list API =404= on this Forgejo version).
+- Toolchain pin :: go.mod declares =go 1.24.0=; flake.nix devshell pins =go_1_24=; =nix develop -c go version= yields =go1.24.10= locally. The exact gate ran locally at the run-log head in =2.3s= (all tests offline).
+- Go modules :: not vendored (no =vendor/=); =go build= downloads =modernc.org/sqlite= et al into the module cache on a cold cache (one-time, then warm on the persistent runner host).
+
+* Design
+- Smallest coherent change :: one workflow file =.forgejo/workflows/ci.yml= plus one sentence in README "Development". No code changes; the repository gate itself is unchanged.
+- Runner choice :: =runs-on: nixos=. Reasons: (1) the only label proven green on this instance (infra check.yml, 236 runs); (2) satisfies the issue's "no Docker, no network-dependent steps" — the job executes directly on the host runner via the repo's own Nix devshell (no container pull, no setup-go tarball download, no apt steps); (3) toolchain is pinned by the repo's own flake (=go_1_24=) matching go.mod, satisfying "the forge's built-in Go toolchain ... pinned to the Go version from go.mod"; (4) no secrets required.
+- Trigger surface :: =push= restricted to =branches: [master]= plus =pull_request= (runs on every PR regardless of base/head branch) plus =workflow_dispatch= for manual gates. Every rage/* branch push would burn shared runner capacity (capacity=2 across the whole guest), so branch pushes rely on the PR trigger instead — matching the issue's "on pushes to master and on every pull request".
+- Concurrency :: group =${{ github.workflow }}-${{ github.ref }}=, =cancel-in-progress: true= — a force of new commits on the same PR cancels the superseded run; different refs never cancel each other; master pushes are sequential by construction (one push per merge).
+- Steps :: =actions/checkout@v4= then =nix develop --command bash -ec 'go build ./... && go vet ./... && go test ./...'= — the exact README gate string executed inside the devshell. =timeout-minutes: 30= budgets the cold-cache first run (nix eval + module download); steady-state runs are minutes.
+- Negative-check protocol :: first PR commit contains the workflow *with* one extra final step =name: negative proof (deliberately failing step)= / =run: false=, proving the workflow actually executes and gates (expected red). Second commit removes that step; the PR's final head shows the green run of the exact workflow. Both run records are preserved as evidence.
+- Compatibility :: no repository code touched; no Docker/release/publish jobs; no secrets; no GitHub Actions mirroring (Forgejo prime only, per scope guard).
+
+* Adversarial review
+- Runner starvation :: capacity is 2 shared across all repos. Mitigated: master-push-only + PR triggers, per-ref concurrency with cancel-in-progress, single job, ~2.3s of actual work. Worst realistic contention is queueing, not failure; the 30-minute timeout covers a queued start.
+- Cold-cache first run :: =nix develop= evaluates the repo flake and may fetch from =cache.nixos.org=, and =go build= fills =GOPATH=/go module cache for =modernc.org/sqlite= et al. Both are one-time; recorded as the expected reason the first run is slower. Steady-state uses warm caches on the persistent guest.
+- Runner label drift :: if infra later renames/removes the =nixos= label, jobs queue forever (no runner matches). Accepted: the label is the instance's proven convention and infra-owned; a deleted label is loud (queued runs) rather than silent.
+- Checkout on host runner :: =actions/checkout@v4= fetches from the forge over the actions bridge; proven working on =nixos= by infra check.yml. No fork-PR approval risk: PRs come from branches in the same repository by owner =nsaspy=.
+- Go version skew :: devshell =go_1_24= (1.24.10) could diverge from go.mod directive (1.24.0) in future nixpkgs bumps; the gate failing loudly is correct behavior, not a hidden skew, and the fix is repo-owned (flake/go.mod bump).
+- The workflow itself cannot gate the workflow-adding PR from *master* state: the PR run is the first-ever execution, so "green run at exact PR head" is the only possible proof that the workflow gates; the deliberately-failing commit provides the negative half.
+- Failing-step residue :: the negative step must not linger in master; protocol removes it in the second commit before merge, and the merged master never contains =run: false=.
+
+* Auto-RAGE decision
+- Decision :: Approved for realization within this run: add =.forgejo/workflows/ci.yml= (job =gate=, =runs-on: nixos=, triggers push-to-master + pull_request + workflow_dispatch, per-ref concurrency, =timeout-minutes: 30=, steps =actions/checkout@v4= + devshell-gated =go build ./... && go vet ./... && go test ./...=), land the deliberately-failing negative-proof step in the first PR commit and remove it in the second, and add one sentence to README "Development" pointing at the workflow. No other jobs, no Docker, no secrets.
+
+* Outcome
+- Gate :: recorded below after merge.
