@@ -61,8 +61,11 @@ sync converges the other side. For every other object the service never
 picks a winner: when both sides changed the same object since the last
 synchronized state, the object's divergent hashes are recorded in the
 `conflicts` table and surfaced by `forge-sync conflicts`, the `/metrics`
-endpoint, and the `inspect` subcommand. Operators resolve manually; the next
-reconciliation then treats the resolved state as canonical.
+endpoint, and the `inspect` subcommand. Operators resolve manually with
+`forge-sync conflicts resolve <id>` (rows are listed with stable IDs); the
+next reconciliation then treats the resolved state as canonical. Resolved
+rows stay in the database for audit and never disappear from it; nothing
+resolves conflicts automatically.
 
 ## Configuration
 
@@ -119,7 +122,7 @@ before the next request. Other `4xx` failures fail immediately.
 ## Usage
 
 ```text
-forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|wire-webhooks [--dry-run]|serve}
+forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts [resolve <id>]|wire-webhooks [--dry-run]|serve}
 ```
 
 - `bootstrap --dry-run` — inventory both forges and report drift without any
@@ -132,7 +135,11 @@ forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect
 - `status` — mapping counts (repositories, issues, PRs, comments, releases,
   conflicts, webhook deliveries, runs).
 - `inspect owner/repo` — mappings and conflicts for one repository.
-- `conflicts` — unresolved conflict list in JSON.
+- `conflicts` — unresolved conflict list in JSON with stable row IDs.
+- `conflicts resolve <id>` — mark exactly that row resolved (`resolved_at` is
+  written; the row stays in the database for audit and disappears from the
+  unresolved list and counts). Resolution is an explicit operator action and
+  is never performed automatically during reconciliation.
 
 ### Endpoints (serve mode)
 

@@ -499,7 +499,7 @@ ON CONFLICT(kind, repository, object_key, github_state, forgejo_state) DO NOTHIN
 
 func (s *Store) ListConflicts(ctx context.Context) ([]model.Conflict, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT kind, repository, object_key, github_state, forgejo_state, last_known_state, created_at
+SELECT id, kind, repository, object_key, github_state, forgejo_state, last_known_state, created_at
 FROM conflicts WHERE resolved_at IS NULL ORDER BY created_at, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list conflicts: %w", err)
@@ -509,7 +509,7 @@ FROM conflicts WHERE resolved_at IS NULL ORDER BY created_at, id`)
 	for rows.Next() {
 		var conflict model.Conflict
 		var created string
-		if err := rows.Scan(&conflict.Kind, &conflict.Repository, &conflict.ObjectKey, &conflict.GitHubState, &conflict.ForgejoState, &conflict.LastKnownState, &created); err != nil {
+		if err := rows.Scan(&conflict.ID, &conflict.Kind, &conflict.Repository, &conflict.ObjectKey, &conflict.GitHubState, &conflict.ForgejoState, &conflict.LastKnownState, &created); err != nil {
 			return nil, fmt.Errorf("scan conflict: %w", err)
 		}
 		conflict.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
@@ -519,6 +519,58 @@ FROM conflicts WHERE resolved_at IS NULL ORDER BY created_at, id`)
 		result = append(result, conflict)
 	}
 	return result, rows.Err()
+}
+
+// ResolveConflict marks exactly one unresolved conflict row as resolved and
+// returns the updated row. It reports false when no unresolved conflict with
+// that ID exists, without touching anything; resolved rows are never deleted.
+func (s *Store) ResolveConflict(ctx context.Context, id int64) (model.Conflict, bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE conflicts SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL`,
+		now(), id)
+	if err != nil {
+		return model.Conflict{}, false, fmt.Errorf("resolve conflict %d: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return model.Conflict{}, false, err
+	}
+	if count != 1 {
+		return model.Conflict{}, false, nil
+	}
+	return s.conflictByID(ctx, id)
+}
+
+func (s *Store) conflictByID(ctx context.Context, id int64) (model.Conflict, bool, error) {
+	var conflict model.Conflict
+	var created, resolved string
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, kind, repository, object_key, github_state, forgejo_state, last_known_state, created_at, resolved_at
+FROM conflicts WHERE id = ?`, id)
+	if err != nil {
+		return model.Conflict{}, false, fmt.Errorf("read conflict %d: %w", id, err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return model.Conflict{}, false, fmt.Errorf("read conflict %d: %w", id, err)
+		}
+		return model.Conflict{}, false, nil
+	}
+	err = rows.Scan(&conflict.ID, &conflict.Kind, &conflict.Repository, &conflict.ObjectKey, &conflict.GitHubState, &conflict.ForgejoState, &conflict.LastKnownState, &created, &resolved)
+	if err != nil {
+		return model.Conflict{}, false, fmt.Errorf("read conflict %d: %w", id, err)
+	}
+	conflict.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return model.Conflict{}, false, fmt.Errorf("parse conflict time: %w", err)
+	}
+	resolvedAt, err := time.Parse(time.RFC3339Nano, resolved)
+	if err != nil {
+		return model.Conflict{}, false, fmt.Errorf("parse conflict resolved_at: %w", err)
+	}
+	conflict.ResolvedAt = &resolvedAt
+	return conflict, true, nil
 }
 
 func (s *Store) BeginRun(ctx context.Context, scope string, dryRun bool) (int64, error) {

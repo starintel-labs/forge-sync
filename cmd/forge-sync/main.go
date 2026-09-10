@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -98,14 +99,29 @@ func run(arguments []string) error {
 		}
 		return inspect(ctx, runtime.store, arguments[1])
 	case "conflicts":
-		if len(arguments) != 1 {
+		switch {
+		case len(arguments) == 1:
+			conflicts, err := runtime.store.ListConflicts(ctx)
+			if err != nil {
+				return err
+			}
+			return writeJSON(conflicts)
+		case len(arguments) == 3 && arguments[1] == "resolve":
+			id, err := strconv.ParseInt(arguments[2], 10, 64)
+			if err != nil || id <= 0 {
+				return usageError()
+			}
+			conflict, resolved, err := runtime.store.ResolveConflict(ctx, id)
+			if err != nil {
+				return err
+			}
+			if !resolved {
+				return fmt.Errorf("no unresolved conflict with id %d", id)
+			}
+			return writeJSON(conflict)
+		default:
 			return usageError()
 		}
-		conflicts, err := runtime.store.ListConflicts(ctx)
-		if err != nil {
-			return err
-		}
-		return writeJSON(conflicts)
 	case "wire-webhooks":
 		flags := flag.NewFlagSet("wire-webhooks", flag.ContinueOnError)
 		dryRun := flags.Bool("dry-run", false, "report planned webhook changes without any mutation")
@@ -274,5 +290,5 @@ func writeJSON(value any) error {
 }
 
 func usageError() error {
-	return errors.New("usage: forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts|wire-webhooks [--dry-run]|serve}")
+	return errors.New("usage: forge-sync {status|bootstrap [--dry-run]|discover|reconcile [owner/repo]|inspect owner/repo|conflicts [resolve <id>]|wire-webhooks [--dry-run]|serve}")
 }
