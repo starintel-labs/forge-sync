@@ -33,4 +33,10 @@
 - Decision :: Approved for realization within this run: add =.forgejo/workflows/ci.yml= (job =gate=, =runs-on: nixos=, triggers push-to-master + pull_request + workflow_dispatch, per-ref concurrency, =timeout-minutes: 30=, steps =actions/checkout@v4= + devshell-gated =go build ./... && go vet ./... && go test ./...=), land the deliberately-failing negative-proof step in the first PR commit and remove it in the second, and add one sentence to README "Development" pointing at the workflow. No other jobs, no Docker, no secrets.
 
 * Outcome
-- Gate :: recorded below after merge.
+- Negative proof :: Forgejo Actions run =3618= (index 1, event =pull_request=, PR #11) at head =bf6bb9607de02a23695e09785e8c75c12963ea82= (workflow containing the deliberately failing final step) ended =failure= after 117s — failure of a step fails the run, so the gate is a real gate. Recorded by prolog-verify observe.
+- Positive proof :: run at head =1fbe90d85cfb3af6b352d5534fe3e8d4e3f128c6= (identical workflow with only the deliberate step removed) finished =success= in 6s. The failure/success differential attributes the red run to the deliberate step and proves the exact gate executes green on the =nixos= runner.
+- Merge SHA :: =15f7fe250396f82134d49a08e669c6d2b126435c= (PR #11 merged into Forgejo master with =--style merge=; issue #9 auto-closed by "Closes #9")
+- Master push gate :: the push event run at the merge commit =15f7fe2= finished =success=, proving the push-to-master trigger.
+- Gate :: =go build ./...=, =go vet ./...=, =go test ./...= green at the exact merged head (worktree observed by prolog-verify) and green on the forge for both the PR head and the merged master push.
+- Note :: the repository is =private=true on the Forgejo instance, so anonymous web page fetches return 404; all run evidence was recorded through the API as =nsaspy=.
+- Note :: this Forgejo version exposes no repo-level job/step API; step attribution uses the recorded run-sha differential plus the 117s duration (checkout + devshell + gate steps completed before the deliberate failure).
