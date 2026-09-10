@@ -198,5 +198,13 @@ go test ./...       # unit + local git integration tests (no network)
 Forgejo Actions runs this gate on every pull request and on pushes to
 `master` (`.forgejo/workflows/ci.yml`).
 
+### Branch topology
+
+`master` is the single integration branch on both forges and the default
+branch on both; `main` is retired and `refs/heads/main` must not be
+recreated on either forge. Target pull requests at `master` only. If a
+`main` ref is ever recreated, it re-enters ordinary same-name ref sync
+and converges like any other branch; it is not an alias for `master`.
+
 Migrations are embedded SQL files under `migrations/` applied in order on
 startup; they are transactional and versioned.

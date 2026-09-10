@@ -1,0 +1,37 @@
+* Run identity
+- Consumed issue :: #10
+- Branch :: =rage/10-default-branch-convergence=
+- RAGE start commit :: =151cabbcfefde76f2fb1512c7e1aa93f9ef4d23e=
+
+* Research
+- Issue evidence (stale snapshot at issue time) :: after PR #7, Forgejo master=79733bc/main=dd338d1, GitHub master=main=dd338d1; refs sync by identical ref name only (=internal/gitrefs/policy.go= compares same-named refs, =internal/gitrefs/sync.go= fetches into per-forge namespaces); GitHub default=main; Forgejo default reportedly =codex/forge-sync-handoff=.
+- Fresh evidence (2026-09-10, at run start SHA) :: =git ls-remote --symref= shows Forgejo HEAD -> =refs/heads/master= (the issue's Forgejo default-branch defect is already healed; API confirms =default_branch=master=). GitHub HEAD -> =refs/heads/codex/forge-sync-handoff= (GitHub default moved off main onto the handoff branch; front page of the public mirror shows a stale branch). Refs: Forgejo master=151cabb/main=dd338d1; GitHub master=main=dd338d1. GitHub =pushed_at=2026-09-08T02:02:22Z= — the deployed service has not advanced GitHub refs since master was dd338d1.
+- Ref pairing is pure :: =Plan= unions ref names and compares same-named refs (policy.go:42-73); there is no default-branch or name-mapping concept anywhere in the tree.
+- main has zero consumers :: =starintel-infra/flake.nix= pins forge-sync with =?ref=master=; GitHub PRs: only #1 (=feat/nixos-module= -> =main=) is MERGED (historical); no open PR targets =main= on either forge; =main= is unprotected on GitHub.
+- Deployment reality :: the deployed service binary is pinned by =starintel-infra/flake.lock= at forge-sync =dd338d1= (pre-#6/#7) and last GitHub mutation was Sep 8 — the service is not currently converging this repository, and it can only be reached through infra (no shell access from this repo's environment). The convergence mechanism itself (same-name fast-forward) predates and is unchanged by this issue.
+- Service deletion behavior :: =Plan= never emits deletions; pushes only. Once =refs/heads/main= is deleted on both forges, no service version can resurrect it (one-side-missing only copies, and there is nothing left to copy).
+
+* Design
+- Durable branch model :: *retire main*. =master= becomes the single integration ref on both forges; the GitHub default branch becomes =master=; =refs/heads/main= is deleted on both forges by operator action. This is the smallest version that converges the GitHub default branch with the Forgejo integration branch, and it needs no code, no redeploy, and no new config surface.
+- Why not the branch map (rejected) :: a =github/main <-> forgejo/master= map adds a config surface plus a ref-name translation layer inside =Plan=/=Sync=; mapped refs must be excluded from ordinary same-name pairing or =github/main= gets two sources (Forgejo =master= via the map and Forgejo =main= as an ordinary ref) producing spurious divergence conflicts; the Forgejo-side =main= remains a permanently stale orphan needing either manual care or its own mapping; and the change is inert until infra redeploys the service (currently pinned at =dd338d1=). The problem the map solves vanishes entirely when =main= is retired: master is the only integration ref, and the already-deployed same-name fast-forward semantics converge it.
+- Scope-guard compliance :: no code path gains ref deletion (the service's no-deletion contract is untouched); =main= is removed by operator git/API actions, not by forge-sync; the #6 divergence policy is untouched (no code change); no force-push anywhere (GitHub master fast-forwards =dd338d1 -> 151cabb=; all other pushes are identical-SHA or no-op).
+- Ops sequence (each step recorded by prolog-verify observe) :: (1) PATCH GitHub =default_branch=codex/forge-sync-handoff -> master=; (2) delete =refs/heads/main= on GitHub (unprotected, not the default branch); (3) delete =refs/heads/main= on Forgejo via the branches API; (4) fast-forward GitHub master to Forgejo master SHA (the #6 human-alignment path, ordinary fast-forward); (5) record before/after =ls-remote= evidence for both forges.
+- Resurrection race :: the service reconciles every 5 minutes and reacts to webhooks; deleting both mains promptly leaves at most one transient resurrection which the identical re-delete converges. With the service currently quiet (no GitHub push since Sep 8) the race window is practically nil, and the end state is stable for any service version.
+- README :: add the branch topology to "Development"/behavior docs: =master= is the single integration branch on both forges; =main= is retired; recreating =main= on either forge simply re-enters ordinary same-name sync (self-healing); do not target PRs at =main=.
+- Rollback :: recreating =refs/heads/main= from =master= on both forges is an ordinary (non-force) push; the ops change is reversible.
+
+* Adversarial review
+- Losing commits :: =main= on both forges is =dd338d1=, an ancestor of =master= on both forges — deletion loses no commit; the object remains reachable through master's history.
+- Service interference :: the deployed service (any version) neither deletes refs nor tracks refs in its mapping database (mappings cover issues/PRs/releases/secrets only); a mid-cycle race can only re-copy a still-existing =main= from one forge to the other, which a re-delete fixes; with both deleted there is nothing to resurrect.
+- Downstream pins :: infra pins =ref=master=; the GitHub mirror's only =main= consumer is a merged PR; no CI/protection references =main=. The Forgejo wiki branch is =main= (repo wiki) but is a separate wiki repository, unaffected.
+- Default-branch permission :: changing the GitHub default branch needs admin; if the PAT lacks it, the residual state (GitHub default still =codex/forge-sync-handoff=) is recorded as an explicit operator follow-up rather than silently skipped.
+- Deployed service stale pin :: convergence of future master pushes depends on the service resuming; the =dd338d1= flake pin is infra-owned and out of this repository's scope; recorded as follow-up evidence in the run log, not "fixed" here.
+- Behavior invariants :: the sync engine is untouched, so all existing deterministic tests (fast-forward both directions, divergence recording, no deletion, no force) remain the executable proof that master-to-master behavior is unchanged.
+
+* Auto-RAGE decision
+- Decision :: Approved for realization within this run: zero code changes; retire =refs/heads/main= on both forges via operator action (GitHub first after switching its default branch to =master=, then Forgejo), fast-forward GitHub master to the Forgejo master SHA, verify with recorded =ls-remote= evidence on both forges, and document the branch topology in README (including the recreation/re-enters-ordinary-sync rule and the GitHub default-branch setting). The Forgejo default-branch ops item of requirement 1 is verified already-satisfied (=master=) and recorded.
+
+* Realization
+- Ops evidence below (recorded by prolog-verify observe during execution).
+
+* Outcome
