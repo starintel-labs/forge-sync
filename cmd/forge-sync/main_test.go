@@ -14,6 +14,22 @@ import (
 	"github.com/starintel-labs/forge-sync/internal/state"
 )
 
+// hermeticEnvironment pins every variable the runtime construction reads so
+// the CLI tests never depend on ambient forge credentials (they must pass on
+// a machine with no FORGE_SYNC_* environment at all).
+func hermeticEnvironment(t *testing.T) string {
+	t.Helper()
+	t.Setenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET", "test-github-secret")
+	t.Setenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET", "test-forgejo-secret")
+	t.Setenv("FORGE_SYNC_GITHUB_API", "https://github.invalid")
+	t.Setenv("FORGE_SYNC_GITHUB_TOKEN", "test-github-token")
+	t.Setenv("FORGE_SYNC_FORGEJO_API", "https://forgejo.invalid")
+	t.Setenv("FORGE_SYNC_FORGEJO_TOKEN", "test-forgejo-token")
+	path := filepath.Join(t.TempDir(), "state.db")
+	t.Setenv("FORGE_SYNC_STATE_PATH", path)
+	return path
+}
+
 func seedConflict(t *testing.T, path string) int64 {
 	t.Helper()
 	store, err := state.Open(path)
@@ -61,8 +77,7 @@ func captureStdout(t *testing.T, arguments []string) (string, error) {
 }
 
 func TestConflictsResolveCommandMarksRowResolved(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
-	t.Setenv("FORGE_SYNC_STATE_PATH", path)
+	path := hermeticEnvironment(t)
 	id := seedConflict(t, path)
 
 	output, err := captureStdout(t, []string{"conflicts", "resolve", strconv.FormatInt(id, 10)})
@@ -92,8 +107,7 @@ func TestConflictsResolveCommandMarksRowResolved(t *testing.T) {
 }
 
 func TestConflictsResolveCommandRejectsUnknownID(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
-	t.Setenv("FORGE_SYNC_STATE_PATH", path)
+	path := hermeticEnvironment(t)
 	seedConflict(t, path)
 
 	if err := run([]string{"conflicts", "resolve", "999999"}); err == nil {
@@ -115,7 +129,7 @@ func TestConflictsResolveCommandRejectsUnknownID(t *testing.T) {
 }
 
 func TestConflictsResolveCommandRejectsMalformedID(t *testing.T) {
-	t.Setenv("FORGE_SYNC_STATE_PATH", filepath.Join(t.TempDir(), "state.db"))
+	hermeticEnvironment(t)
 	for _, arguments := range [][]string{
 		{"conflicts", "resolve", "abc"},
 		{"conflicts", "resolve"},
@@ -129,8 +143,7 @@ func TestConflictsResolveCommandRejectsMalformedID(t *testing.T) {
 }
 
 func TestConflictsListCommandEmitsRowIDs(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.db")
-	t.Setenv("FORGE_SYNC_STATE_PATH", path)
+	path := hermeticEnvironment(t)
 	id := seedConflict(t, path)
 
 	output, err := captureStdout(t, []string{"conflicts"})

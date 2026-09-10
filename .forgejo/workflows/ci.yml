@@ -20,5 +20,5 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: go build ./... && go vet ./... && go test ./internal/...
-        run: nix develop --command bash -ec 'go build ./... && go vet ./... && go test ./internal/...'
+      - name: go build ./... && go vet ./... && go test ./...
+        run: nix develop --command bash -ec 'go build ./... && go vet ./... && go test ./...'
