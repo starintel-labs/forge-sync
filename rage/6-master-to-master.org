@@ -1,0 +1,27 @@
+* Run identity
+- Consumed issue :: #6
+- Branch :: =rage/6-master-to-master=
+- RAGE start commit :: =dd338d1cdf32ff425b0c06132ad7e419a09bae62=
+
+* Research
+- Issue evidence :: Forgejo issue #6: refs fast-forward in either direction, but on true divergence the Forgejo SHA is force-pushed onto GitHub and GitHub-only commits are silently destroyed (internal/gitrefs/policy.go:31,68; README "Forgejo is the master forge").
+- Current plan semantics :: missing-on-one-side refs are copied to the other side in both directions; ahead/behind refs fast-forward in both directions; only true divergence is asymmetric.
+- Conflict plumbing :: =model.Conflict= carries both SHAs (=GitHubState=, =ForgejoState=); =Store.AddConflict= dedups on (kind, repository, object_key, github_state, forgejo_state) with =ON CONFLICT DO NOTHING=, so repeated reconciliations of the same divergence do not multiply rows; =forge-sync conflicts= and =inspect= surface unresolved records.
+- No force-push at the Forgejo side exists today; history is only ever overwritten on GitHub.
+
+* Design
+- Symmetry invariant :: neither forge is the master. The only asymmetric rule (Forgejo wins divergence) is replaced by: true divergence is *recorded, never auto-resolved*; both sides are left untouched until a human pushes the winning SHA to one forge, after which normal fast-forward sync converges the other side.
+- Plan output for divergence :: zero actions for the ref plus one conflict of kind =git-ref-divergence= carrying both SHAs.
+- Force capability removed :: =Action.Force= and the =--force= push flag are deleted from the sync path; a losing race against a concurrent push is now rejected by the receiving forge as a non-fast-forward and surfaces as a reconciliation error instead of destroying history.
+- Unchanged :: one-side-missing refs copy to the missing side in either direction; ahead refs fast-forward in either direction; refs are never deleted; dry-run mutates nothing; ancestry failure aborts planning.
+- Compatibility :: conflict =Kind= changes only for new rows; schema and JSON shape unchanged; historical =git-ref-override= rows remain valid audit records.
+- Rejected alternatives :: bot-authored merge commits (requires committer identity and new commits on the forges; far beyond smallest coherent change); committer-timestamp last-write-wins (forge-independent, gameable, still silently drops one side); keeping Forgejo-wins (precisely what issue #6 removes).
+
+* Adversarial review
+- Divergences no longer self-heal: accepted operator contract; the conflict record with both SHAs is the resolution surface, convergence happens through ordinary fast-forward once a human aligns one side.
+- TOCTOU between fetch and push: pre-existing and non-atomic; without force the worst case is a rejected non-fast-forward push with a loud, retryable error — strictly safer than the current forced overwrite.
+- Conflict accumulation: deduped by the store on both SHAs; a changed SHA pair records one new row, matching release-conflict behavior.
+- Restart/idempotency: planning is pure over fetched refs; repeated runs produce identical plans and deduped conflict rows.
+
+* Auto-RAGE decision
+- Decision :: Approved for realization within this run: symmetric divergence policy (record, do not force), removal of =Force= from =gitrefs.Action= and of =--force= from the push path, README and design-comment updates, and tests proving divergence records a conflict with both SHAs and produces no action while every other path stays two-way.

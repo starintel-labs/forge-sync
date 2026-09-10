@@ -9,3 +9,5 @@
 !.env.example
 .direnv/
 .local-state/
+
+.prolog/

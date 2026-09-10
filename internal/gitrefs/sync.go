@@ -107,9 +107,6 @@ func (s *Synchronizer) Sync(ctx context.Context, repository string, github, forg
 			target = github
 		}
 		args := []string{"--git-dir", gitDir, "push", "--porcelain"}
-		if action.Force {
-			args = append(args, "--force")
-		}
 		args = append(args, target.URL, action.SHA+":"+action.Ref)
 		if _, err := run(ctx, gitDir, target, args...); err != nil {
 			return result, fmt.Errorf("push %s to %s: %w", action.Ref, action.To, err)
