@@ -230,7 +230,7 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		// remaining objects, and let operators surface it via conflicts.
 		if err := e.store.AddConflict(ctx, model.Conflict{
 			Kind: "git-ref-error", Repository: mapping.GitHubFullName,
-			ObjectKey:   "git-refs", GitHubState: "sync-failed", ForgejoState: "sync-failed",
+			ObjectKey: "git-refs", GitHubState: "sync-failed", ForgejoState: "sync-failed",
 			LastKnownState: err.Error(), CreatedAt: time.Now().UTC(),
 		}); err != nil {
 			return RepositoryResult{}, fmt.Errorf("record git-ref failure for %s: %w", mapping.GitHubFullName, err)
@@ -238,6 +238,9 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, nil
 	}
 	if err := e.issues.Reconcile(ctx, mapping, dryRun); err != nil {
+		if result, handled := e.recordMappingCollision(ctx, mapping, dryRun, "issues", err); handled {
+			return result, nil
+		}
 		return RepositoryResult{}, fmt.Errorf("synchronize issues for %s: %w", mapping.GitHubFullName, err)
 	}
 	issueMappings, err := e.store.ListIssueMappings(ctx, mapping.GitHubID)
@@ -245,9 +248,15 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		return RepositoryResult{}, err
 	}
 	if err := e.comments.Reconcile(ctx, mapping, issueMappings, dryRun); err != nil {
+		if result, handled := e.recordMappingCollision(ctx, mapping, dryRun, "comments", err); handled {
+			return result, nil
+		}
 		return RepositoryResult{}, fmt.Errorf("synchronize comments for %s: %w", mapping.GitHubFullName, err)
 	}
 	if err := e.pullRequests.Reconcile(ctx, mapping, dryRun); err != nil {
+		if result, handled := e.recordMappingCollision(ctx, mapping, dryRun, "pull requests", err); handled {
+			return result, nil
+		}
 		return RepositoryResult{}, fmt.Errorf("synchronize pull requests for %s: %w", mapping.GitHubFullName, err)
 	}
 	pullRequestMappings, err := e.store.ListPullRequestMappings(ctx, mapping.GitHubID)
@@ -255,6 +264,9 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		return RepositoryResult{}, err
 	}
 	if err := e.comments.ReconcilePullRequests(ctx, mapping, pullRequestMappings, dryRun); err != nil {
+		if result, handled := e.recordMappingCollision(ctx, mapping, dryRun, "pull request comments", err); handled {
+			return result, nil
+		}
 		return RepositoryResult{}, fmt.Errorf("synchronize pull request comments for %s: %w", mapping.GitHubFullName, err)
 	}
 	if err := e.releases.Reconcile(ctx, mapping, dryRun); err != nil {
@@ -273,6 +285,26 @@ func (e *Engine) reconcileOne(ctx context.Context, mapping model.RepositoryMappi
 		return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, nil
 	}
 	return RepositoryResult{Repository: mapping.GitHubFullName, Actions: gitResult.Actions, Conflicts: len(gitResult.Conflicts)}, nil
+}
+
+// recordMappingCollision converts a mapping-slot collision (a UNIQUE
+// constraint violation on the forgejo side of a mapping table: two upstream
+// objects collapsed onto one counterpart) into a durable per-repository
+// conflict so a single repository's duplicate topology cannot abort the
+// whole reconciliation cycle. Any other error is not handled here.
+func (e *Engine) recordMappingCollision(ctx context.Context, mapping model.RepositoryMapping, dryRun bool, kind string, err error) (RepositoryResult, bool) {
+	if dryRun || err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		return RepositoryResult{}, false
+	}
+	conflict := model.Conflict{
+		Kind: "mapping-collision", Repository: mapping.GitHubFullName,
+		ObjectKey: kind, GitHubState: "duplicate-pairing", ForgejoState: "occupied",
+		LastKnownState: err.Error(), CreatedAt: time.Now().UTC(),
+	}
+	if addErr := e.store.AddConflict(ctx, conflict); addErr != nil {
+		return RepositoryResult{}, false
+	}
+	return RepositoryResult{Repository: mapping.GitHubFullName, Conflicts: 1}, true
 }
 
 func (e *Engine) ProcessWebhook(ctx context.Context, _ string, _ string, payload []byte) error {
