@@ -181,7 +181,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 		consumedForgejo[forgejoID] = true
 		if !dryRun {
 			if err := r.store.UpsertPullRequestMapping(ctx, pullRequestMapping(repository.GitHubID, githubItem, forgejoItem)); err != nil {
-				return err
+				if err := r.pairingConflict(ctx, repository, githubItem, forgejoItem, err); err != nil {
+					return err
+				}
+				continue
 			}
 		}
 	}
@@ -257,7 +260,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 			return fmt.Errorf("invalid created Forgejo pull request: %w", err)
 		}
 		if err := r.store.UpsertPullRequestMapping(ctx, pullRequestMapping(repository.GitHubID, githubItem, created)); err != nil {
-			return err
+			// Two GitHub pull requests can share one Forgejo pull request
+			// (the same head ref reused after the first pull request was
+			// closed): the adopted twin already holds the mapping slot.
+			if err := r.pairingConflict(ctx, repository, githubItem, created, err); err != nil {
+				return err
+			}
+			consumedGitHub[githubItem.ID] = true
+			continue
 		}
 	}
 	for _, forgejoItem := range unconsumed(forgejoPullRequests, consumedForgejo) {
@@ -314,10 +324,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, repository model.RepositoryM
 			return fmt.Errorf("invalid created GitHub pull request: %w", err)
 		}
 		if err := r.store.UpsertPullRequestMapping(ctx, pullRequestMapping(repository.GitHubID, created, forgejoItem)); err != nil {
-			return err
+			if err := r.pairingConflict(ctx, repository, created, forgejoItem, err); err != nil {
+				return err
+			}
+			consumedForgejo[forgejoItem.ID] = true
+			continue
 		}
 	}
 	return nil
+}
+
+// pairingConflict records a mapping-slot collision (a UNIQUE violation on
+// the Forgejo side of the mapping) as a conflict row so one repository's
+// duplicate pull request topology cannot abort the whole reconciliation
+// cycle. Any other error is returned unchanged.
+func (r *Reconciler) pairingConflict(ctx context.Context, repository model.RepositoryMapping, githubItem, forgejoItem model.PullRequest, err error) error {
+	if err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed") {
+		return err
+	}
+	return r.store.AddConflict(ctx, model.Conflict{
+		Kind: "pull-request-pairing", Repository: repository.GitHubFullName,
+		ObjectKey:   fmt.Sprintf("github:%d/forgejo:%d", githubItem.ID, forgejoItem.ID),
+		GitHubState: Hash(githubItem), ForgejoState: Hash(forgejoItem), LastKnownState: "already-paired",
+		CreatedAt: time.Now().UTC(),
+	})
 }
 
 func Hash(item model.PullRequest) string {

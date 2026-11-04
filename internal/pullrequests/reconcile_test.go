@@ -12,9 +12,10 @@ import (
 )
 
 type fakePullRequests struct {
-	items   []model.PullRequest
-	created []model.PullRequest
-	updated []model.PullRequest
+	items          []model.PullRequest
+	created        []model.PullRequest
+	updated        []model.PullRequest
+	returnExisting map[string]model.PullRequest // head -> existing pull request returned by create
 }
 
 func (f *fakePullRequests) ListPullRequests(context.Context, string, string) ([]model.PullRequest, error) {
@@ -31,6 +32,11 @@ func (f *fakePullRequests) FindPullRequestByHead(_ context.Context, _, _, head s
 }
 
 func (f *fakePullRequests) CreatePullRequest(_ context.Context, _, _ string, item model.PullRequest) (model.PullRequest, error) {
+	if existing, ok := f.returnExisting[item.Head]; ok {
+		// Some Gitea/Forgejo versions answer a duplicate-refs create with
+		// the preexisting pull request instead of a 409.
+		return existing, nil
+	}
 	f.created = append(f.created, item)
 	item.ID = 1000 + int64(len(f.created))
 	item.Index = 2000 + int64(len(f.created))
@@ -94,6 +100,38 @@ func TestConcurrentPullRequestMetadataCreatesConflict(t *testing.T) {
 	conflicts, err := store.ListConflicts(context.Background())
 	if err != nil || len(conflicts) != 1 || conflicts[0].Kind != "pull-request" {
 		t.Fatalf("conflicts=%#v err=%v", conflicts, err)
+	}
+}
+
+func TestAdoptedDuplicateRecordsPairingConflictInsteadOfFailing(t *testing.T) {
+	t.Parallel()
+	store, repository := prState(t)
+	first := model.PullRequest{ID: 11, Index: 172, Title: "gate", State: "closed", Head: "rage/dual", Base: "main", Merged: false}
+	if err := store.UpsertPullRequestMapping(context.Background(), model.PullRequestMapping{
+		RepositoryGitHubID: 1, GitHubID: 11, ForgejoID: 22, GitHubIndex: 172, ForgejoIndex: 191,
+		LastStateHash: pullrequests.Hash(first), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	twin := model.PullRequest{ID: 12, Index: 173, Title: "consumer", State: "closed", Head: "rage/dual", Base: "main", Merged: true}
+	forgejoItem := first
+	forgejoItem.ID, forgejoItem.Index = 22, 191
+	forgejo := &fakePullRequests{
+		items:          []model.PullRequest{forgejoItem},
+		returnExisting: map[string]model.PullRequest{"rage/dual": forgejoItem},
+	}
+	github := &fakePullRequests{items: []model.PullRequest{first, twin}}
+
+	if err := pullrequests.New(github, forgejo, store).Reconcile(context.Background(), repository, false); err != nil {
+		t.Fatal(err)
+	}
+	conflicts, err := store.ListConflicts(context.Background())
+	if err != nil || len(conflicts) != 1 || conflicts[0].Kind != "pull-request-pairing" {
+		t.Fatalf("conflicts=%#v err=%v", conflicts, err)
+	}
+	mappings, err := store.ListPullRequestMappings(context.Background(), 1)
+	if err != nil || len(mappings) != 1 || mappings[0].GitHubID != 11 {
+		t.Fatalf("mappings=%#v err=%v", mappings, err)
 	}
 }
 
