@@ -31,16 +31,20 @@ type Reconciler struct {
 	store       *state.Store
 	githubToken string
 	ownerMap    map[string]string
+	repoMap     map[string]string
 }
 
 // New builds a repository reconciler. ownerMap optionally redirects GitHub
 // namespaces to different Forgejo owners (for example
-// "starintel-labs:nsaspy"); a nil map keeps namespace identities.
-func New(github GitHub, forgejo Forgejo, store *state.Store, githubToken string, ownerMap map[string]string) *Reconciler {
+// "starintel-labs:nsaspy"); a nil map keeps namespace identities. repoMap
+// optionally redirects single repositories (for example
+// "lost-rob0t/starintel-server:starintel-labs/starintel-server") and takes
+// precedence over ownerMap; a nil map keeps the namespace behavior.
+func New(github GitHub, forgejo Forgejo, store *state.Store, githubToken string, ownerMap map[string]string, repoMap map[string]string) *Reconciler {
 	if github == nil || forgejo == nil || store == nil || githubToken == "" {
 		panic("repository reconciler requires clients, state, and GitHub token")
 	}
-	return &Reconciler{github: github, forgejo: forgejo, store: store, githubToken: githubToken, ownerMap: ownerMap}
+	return &Reconciler{github: github, forgejo: forgejo, store: store, githubToken: githubToken, ownerMap: ownerMap, repoMap: repoMap}
 }
 
 func (r *Reconciler) forgejoOwner(namespace string) string {
@@ -48,6 +52,17 @@ func (r *Reconciler) forgejoOwner(namespace string) string {
 		return owner
 	}
 	return namespace
+}
+
+// forgejoTarget resolves the Forgejo owner and repository name for a GitHub
+// repository. A repoMap entry takes precedence over the namespace owner map.
+func (r *Reconciler) forgejoTarget(source model.Repository, namespaceOwner string) (string, string) {
+	if target, ok := r.repoMap[source.FullName]; ok {
+		if owner, name, ok := strings.Cut(target, "/"); ok && owner != "" && name != "" {
+			return owner, name
+		}
+	}
+	return namespaceOwner, source.Name
 }
 
 func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun bool) (model.Inventory, error) {
@@ -75,6 +90,26 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 		for _, repository := range forgejoRepositories {
 			forgejoByName[strings.ToLower(repository.FullName)] = repository
 		}
+		// Repo-map redirects can move repositories to Forgejo owners outside
+		// the namespace owner; enumerate those owners so unmapped repositories
+		// can still pair with preexisting Forgejo repositories under them.
+		for _, source := range githubRepositories {
+			if source.Owner != namespace {
+				continue
+			}
+			owner, _ := r.forgejoTarget(source, forgejoOwner)
+			if owner == forgejoOwner || countedForgejo["listed:"+owner] {
+				continue
+			}
+			countedForgejo["listed:"+owner] = true
+			extra, err := r.forgejo.ListRepositories(ctx, owner)
+			if err != nil {
+				return inventory, fmt.Errorf("enumerate Forgejo owner %s: %w", owner, err)
+			}
+			for _, repository := range extra {
+				forgejoByName[strings.ToLower(repository.FullName)] = repository
+			}
+		}
 		for _, source := range githubRepositories {
 			if err := validateRepository(source); err != nil {
 				return inventory, err
@@ -88,9 +123,10 @@ func (r *Reconciler) Discover(ctx context.Context, namespaces []string, dryRun b
 			if err != nil {
 				return inventory, err
 			}
+			targetOwner, targetName := r.forgejoTarget(source, forgejoOwner)
 			target := source
-			target.Owner = forgejoOwner
-			target.FullName = forgejoOwner + "/" + source.Name
+			target.Owner = targetOwner
+			target.FullName = targetOwner + "/" + targetName
 			if mapped {
 				if mapping.ForgejoOwner != target.Owner || mapping.ForgejoName != target.Name {
 					if !dryRun {

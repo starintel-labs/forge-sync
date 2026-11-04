@@ -20,7 +20,7 @@ func scrubEnv(t *testing.T) {
 		"FORGE_SYNC_GIT_TIMEOUT", "FORGE_SYNC_MAX_CONCURRENCY",
 		"FORGE_SYNC_MAX_WEBHOOK_BODY", "FORGE_SYNC_API_MAX_ATTEMPTS",
 		"FORGE_SYNC_API_RETRY_BASE", "FORGE_SYNC_API_RETRY_MAX",
-		"FORGE_SYNC_FORGEJO_OWNER_MAP", "FORGE_SYNC_ACTION_SECRET_MAP",
+		"FORGE_SYNC_FORGEJO_OWNER_MAP", "FORGE_SYNC_FORGEJO_REPO_MAP", "FORGE_SYNC_ACTION_SECRET_MAP",
 		"PROLOG_RLM_API_KEY",
 	} {
 		t.Setenv(key, "")
@@ -126,6 +126,44 @@ func TestOwnerMapParsesAndValidates(t *testing.T) {
 		t.Setenv("FORGE_SYNC_FORGEJO_OWNER_MAP", "starintel-labs:nsaspy/x")
 		if _, err := config.FromEnvironment(); err == nil {
 			t.Fatal("malformed owner accepted")
+		}
+	})
+}
+
+func TestRepoMapParsesAndValidates(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Helper()
+		scrubEnv(t)
+		t.Setenv("FORGE_SYNC_GITHUB_TOKEN", "gh")
+		t.Setenv("FORGE_SYNC_FORGEJO_API", "https://forge.example.org")
+		t.Setenv("FORGE_SYNC_FORGEJO_TOKEN", "fj")
+		t.Setenv("FORGE_SYNC_GITHUB_WEBHOOK_SECRET", "ghs")
+		t.Setenv("FORGE_SYNC_FORGEJO_WEBHOOK_SECRET", "fjs")
+	}
+
+	t.Run("valid map", func(t *testing.T) {
+		base(t)
+		t.Setenv("FORGE_SYNC_FORGEJO_REPO_MAP", "lost-rob0t/starintel-server:starintel-labs/starintel-server")
+		cfg, err := config.FromEnvironment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.ForgejoRepoMap["lost-rob0t/starintel-server"] != "starintel-labs/starintel-server" {
+			t.Fatalf("repo map=%v", cfg.ForgejoRepoMap)
+		}
+	})
+	t.Run("key outside namespaces rejected", func(t *testing.T) {
+		base(t)
+		t.Setenv("FORGE_SYNC_FORGEJO_REPO_MAP", "someone-else/repo:nsaspy/repo")
+		if _, err := config.FromEnvironment(); err == nil {
+			t.Fatal("foreign repo map key accepted")
+		}
+	})
+	t.Run("malformed entry rejected", func(t *testing.T) {
+		base(t)
+		t.Setenv("FORGE_SYNC_FORGEJO_REPO_MAP", "lost-rob0t/starintel-server")
+		if _, err := config.FromEnvironment(); err == nil {
+			t.Fatal("repo map entry without target accepted")
 		}
 	})
 }

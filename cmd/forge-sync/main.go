@@ -164,7 +164,7 @@ func openRuntime(cfg config.Config) (*application, error) {
 		store.Close()
 		return nil, err
 	}
-	repositories := repository.New(githubClient, forgejoClient, store, cfg.GitHubToken, cfg.ForgejoOwnerMap)
+	repositories := repository.New(githubClient, forgejoClient, store, cfg.GitHubToken, cfg.ForgejoOwnerMap, cfg.ForgejoRepoMap)
 	issueReconciler := issues.New(githubClient, forgejoClient, store)
 	commentReconciler := comments.New(githubClient, forgejoClient, store)
 	pullRequestReconciler := pullrequests.New(githubClient, forgejoClient, store)
