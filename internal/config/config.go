@@ -41,11 +41,16 @@ type Config struct {
 	MaxAssetSizeBytes    int64
 	APIRetry             api.RetryPolicy
 	ForgejoOwnerMap      map[string]string
+	ForgejoRepoMap       map[string]string
 	ActionSecrets        []model.ActionSecret
 }
 
 func FromEnvironment() (Config, error) {
 	actionSecrets, err := actionSecretsOr("FORGE_SYNC_ACTION_SECRET_MAP")
+	if err != nil {
+		return Config{}, err
+	}
+	repoMap, err := repoMapOr("FORGE_SYNC_FORGEJO_REPO_MAP")
 	if err != nil {
 		return Config{}, err
 	}
@@ -78,6 +83,7 @@ func FromEnvironment() (Config, error) {
 			Sleep:       api.Sleep,
 		},
 		ForgejoOwnerMap: ownerMapOr("FORGE_SYNC_FORGEJO_OWNER_MAP"),
+		ForgejoRepoMap:  repoMap,
 		ActionSecrets:   actionSecrets,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -148,6 +154,16 @@ func (c Config) Validate() error {
 			return fmt.Errorf("owner map target for %q is invalid", namespace)
 		}
 	}
+	for repository, target := range c.ForgejoRepoMap {
+		owner, name, ok := strings.Cut(repository, "/")
+		if !ok || !contains(c.Namespaces, owner) || name == "" || strings.ContainsAny(name, "/ \t") {
+			return fmt.Errorf("repo map key %q is invalid or outside the configured namespaces", repository)
+		}
+		targetOwner, targetName, ok := strings.Cut(target, "/")
+		if !ok || targetOwner == "" || targetName == "" || strings.ContainsAny(targetName, "/ \t") {
+			return fmt.Errorf("repo map target for %q must be forgejo-owner/name", repository)
+		}
+	}
 	seenSecrets := map[string]bool{}
 	for _, secret := range c.ActionSecrets {
 		owner, name, ok := strings.Cut(secret.Repository, "/")
@@ -195,6 +211,27 @@ func ownerMapOr(key string) map[string]string {
 		result[strings.TrimSpace(namespace)] = strings.TrimSpace(owner)
 	}
 	return result
+}
+
+func repoMapOr(key string) (map[string]string, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil, nil
+	}
+	result := map[string]string{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		repository, target, ok := strings.Cut(item, ":")
+		if !ok || strings.Contains(target, ":") {
+			return nil, fmt.Errorf("repo map entry %q must be github-owner/repository:forgejo-owner/repository", item)
+		}
+		repository, target = strings.TrimSpace(repository), strings.TrimSpace(target)
+		if repository == "" || target == "" {
+			return nil, fmt.Errorf("repo map entry %q must be github-owner/repository:forgejo-owner/repository", item)
+		}
+		result[repository] = target
+	}
+	return result, nil
 }
 
 func actionSecretsOr(key string) ([]model.ActionSecret, error) {
